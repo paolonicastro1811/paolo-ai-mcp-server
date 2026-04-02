@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { registerElevenLabsTools } from "../elevenlabs.js";
 import { registerHiggsieldTools } from "../higgsfield.js";
 import { registerPerplexityTools } from "../perplexity.js";
+import { registerSegmindTools } from "../segmind.js";
 import { registerSunoTools } from "../suno.js";
 import { registerHeyGenTools } from "../heygen.js";
 import { registerOpenAITools } from "../openai.js";
@@ -24,6 +25,7 @@ app.post("/mcp", async (req, res) => {
   registerElevenLabsTools(server);
   registerHiggsieldTools(server);
   registerPerplexityTools(server);
+  registerSegmindTools(server);
   registerSunoTools(server);
   registerHeyGenTools(server);
   registerOpenAITools(server);
