@@ -95,3 +95,4 @@ npm start
 # Health check: GET http://localhost:3000/
 # MCP endpoint: POST http://localhost:3000/mcp
 ```
+
