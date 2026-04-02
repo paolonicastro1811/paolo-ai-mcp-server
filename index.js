@@ -13,6 +13,7 @@ const KEYS = {
   suno: process.env.SUNO_API_KEY || "",
   heygen: process.env.HEYGEN_API_KEY || "",
   openai: process.env.OPENAI_API_KEY || "",
+  segmind: process.env.SEGMIND_API_KEY || "",
 };
 
 app.get("/", (_req, res) => {
@@ -221,7 +222,44 @@ app.post("/mcp", async (req, res) => {
     const text = d.video_url ? `✅ Pronto!\nURL: ${d.video_url}` : `⏳ Stato: ${d.status}`;
     return { content: [{ type: "text", text }] };
   });
+// ===== SEGMIND =====
+  server.registerTool("segmind_video_audio_merge", {
+    title: "Segmind - Video Audio Merge",
+    description: "Unisce un file video con un file audio (voiceover o musica).",
+    inputSchema: {
+      input_video: z.string().describe("URL del video"),
+      input_audio: z.string().describe("URL dell'audio"),
+      override_audio: z.boolean().default(true).describe("Sostituisci audio originale"),
+      merge_intensity: z.number().default(0.8).describe("Intensità mix (0-1)"),
+    },
+  }, async ({ input_video, input_audio, override_audio, merge_intensity }) => {
+    const r = await fetch("https://api.segmind.com/v1/video-audio-merge", {
+      method: "POST",
+      headers: { "x-api-key": KEYS.segmind, "Content-Type": "application/json" },
+      body: JSON.stringify({ input_video, input_audio, video_start: 0, video_end: -1, audio_start: 0, audio_end: -1, audio_fade_in: 0, audio_fade_out: 0, override_audio, merge_intensity }),
+    });
+    if (!r.ok) throw new Error(`Segmind error: ${await r.text()}`);
+    const d = await r.json();
+    return { content: [{ type: "text", text: `✅ Video+Audio merged!\nURL: ${d.output_url || d.url || d.output || JSON.stringify(d)}` }] };
+  });
 
+  server.registerTool("segmind_multi_video_merge", {
+    title: "Segmind - Multi Video Merge",
+    description: "Unisce più video clip in sequenza.",
+    inputSchema: {
+      video_urls: z.array(z.string()).describe("Array URL video (min 2, max 10)"),
+      transition_type: z.string().default("fade").describe("Transizione: concat, fade, none"),
+    },
+  }, async ({ video_urls, transition_type }) => {
+    const r = await fetch("https://api.segmind.com/v1/multi-video-merge", {
+      method: "POST",
+      headers: { "x-api-key": KEYS.segmind, "Content-Type": "application/json" },
+      body: JSON.stringify({ video_urls, width: 1080, height: 1920, fps: 30, transition_type, transition_duration: 0.5, maintain_aspect_ratio: true, audio_handling: "merge" }),
+    });
+    if (!r.ok) throw new Error(`Segmind error: ${await r.text()}`);
+    const d = await r.json();
+    return { content: [{ type: "text", text: `✅ ${video_urls.length} video merged!\nURL: ${d.output_url || d.url || d.output || JSON.stringify(d)}` }] };
+  });
   // ===== AVVIA SERVER MCP =====
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => { transport.close(); server.close(); });
