@@ -63,7 +63,7 @@ app.post("/mcp", async (req, res) => {
       method: "POST",
       headers: { "Authorization": `Bearer ${KEYS.perplexity}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "llama-3.1-sonar-large-128k-online",
+        model: "sonar",
         messages: [{ role: "user", content: query }],
         return_citations: true,
       }),
