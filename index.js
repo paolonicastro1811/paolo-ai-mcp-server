@@ -190,7 +190,7 @@ app.post("/mcp", async (req, res) => {
       aspect_ratio: z.string().default("16:9").describe("Aspect ratio: 1:1, 16:9, 9:16, 4:3"),
     },
   }, async ({ prompt, aspect_ratio }) => {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=${KEYS.google}`, {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${KEYS.google}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
