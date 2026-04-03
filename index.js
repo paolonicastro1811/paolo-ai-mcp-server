@@ -127,6 +127,22 @@ app.post("/mcp", async (req, res) => {
     return { content: [{ type: "text", text: text || "Nessun avatar trovato" }] };
   });
 
+  server.registerTool("heygen_list_voices", {
+    title: "HeyGen - Lista Voci",
+    description: "Elenca le voci disponibili su HeyGen, filtrabile per lingua.",
+    inputSchema: {
+      language: z.string().optional().describe("Filtro lingua es: Portuguese, English, Spanish"),
+    },
+  }, async ({ language }) => {
+    const r = await fetch("https://api.heygen.com/v2/voices", { headers: { "X-Api-Key": KEYS.heygen } });
+    if (!r.ok) throw new Error(`HeyGen error: ${await r.text()}`);
+    const d = await r.json();
+    let voices = d.data?.voices || [];
+    if (language) voices = voices.filter(v => v.language?.toLowerCase().includes(language.toLowerCase()));
+    const text = voices.slice(0, 30).map(v => `${v.name} | ${v.language} | ${v.gender} | ID: ${v.voice_id}`).join("\n");
+    return { content: [{ type: "text", text: text || "Nessuna voce trovata" }] };
+  });
+
   server.registerTool("heygen_generate_video", {
     title: "HeyGen - Genera Video Avatar",
     description: "Genera un video con un avatar AI che parla un testo.",
