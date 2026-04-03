@@ -63,11 +63,7 @@ app.post("/mcp", async (req, res) => {
     const r = await fetch("https://api.perplexity.ai/chat/completions", {
       method: "POST",
       headers: { "Authorization": `Bearer ${KEYS.perplexity}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "sonar",
-        messages: [{ role: "user", content: query }],
-        return_citations: true,
-      }),
+      body: JSON.stringify({ model: "sonar", messages: [{ role: "user", content: query }], return_citations: true }),
     });
     if (!r.ok) throw new Error(`Perplexity error: ${await r.text()}`);
     const d = await r.json();
@@ -112,17 +108,19 @@ app.post("/mcp", async (req, res) => {
     return { content: [{ type: "text", text: `🎨 Immagine generata!\nURL: ${d.data[0].url}` }] };
   });
 
-  // ===== HEYGEN =====
+  // ===== HEYGEN (aggiornato a V2) =====
   server.registerTool("heygen_list_avatars", {
     title: "HeyGen - Lista Avatar",
     description: "Elenca gli avatar disponibili su HeyGen.",
     inputSchema: {},
   }, async () => {
-    const r = await fetch("https://api.heygen.com/v1/avatar.list", { headers: { "X-Api-Key": KEYS.heygen } });
+    // FIX V2: era /v1/avatar.list
+    const r = await fetch("https://api.heygen.com/v2/avatars", { headers: { "X-Api-Key": KEYS.heygen } });
     if (!r.ok) throw new Error(`HeyGen error: ${await r.text()}`);
     const d = await r.json();
-    const text = d.data.avatars.slice(0, 20).map(a => `${a.avatar_name} (ID: ${a.avatar_id})`).join("\n");
-    return { content: [{ type: "text", text }] };
+    const avatars = d.data?.avatars || [];
+    const text = avatars.slice(0, 20).map(a => `${a.avatar_name} (ID: ${a.avatar_id})`).join("\n");
+    return { content: [{ type: "text", text: text || "Nessun avatar trovato" }] };
   });
 
   server.registerTool("heygen_generate_video", {
@@ -152,10 +150,12 @@ app.post("/mcp", async (req, res) => {
     description: "Controlla lo stato di un video HeyGen.",
     inputSchema: { video_id: z.string().describe("ID del video") },
   }, async ({ video_id }) => {
-    const r = await fetch(`https://api.heygen.com/v1/video_status.get?video_id=${video_id}`, { headers: { "X-Api-Key": KEYS.heygen } });
+    // FIX V2: era /v1/video_status.get?video_id=...
+    const r = await fetch(`https://api.heygen.com/v2/videos/${video_id}`, { headers: { "X-Api-Key": KEYS.heygen } });
     if (!r.ok) throw new Error(`HeyGen error: ${await r.text()}`);
     const d = await r.json();
-    const text = d.data.video_url ? `✅ Pronto!\nURL: ${d.data.video_url}` : `⏳ Stato: ${d.data.status}`;
+    const videoData = d.data || {};
+    const text = videoData.video_url ? `✅ Pronto!\nURL: ${videoData.video_url}` : `⏳ Stato: ${videoData.status}`;
     return { content: [{ type: "text", text }] };
   });
 
@@ -222,7 +222,8 @@ app.post("/mcp", async (req, res) => {
     const text = d.video_url ? `✅ Pronto!\nURL: ${d.video_url}` : `⏳ Stato: ${d.status}`;
     return { content: [{ type: "text", text }] };
   });
-// ===== SEGMIND =====
+
+  // ===== SEGMIND =====
   server.registerTool("segmind_video_audio_merge", {
     title: "Segmind - Video Audio Merge",
     description: "Unisce un file video con un file audio (voiceover o musica).",
@@ -260,6 +261,7 @@ app.post("/mcp", async (req, res) => {
     const d = await r.json();
     return { content: [{ type: "text", text: `✅ ${video_urls.length} video merged!\nURL: ${d.output_url || d.url || d.output || JSON.stringify(d)}` }] };
   });
+
   // ===== AVVIA SERVER MCP =====
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => { transport.close(); server.close(); });
