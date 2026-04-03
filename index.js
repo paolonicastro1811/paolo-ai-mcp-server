@@ -14,6 +14,7 @@ const KEYS = {
   heygen: process.env.HEYGEN_API_KEY || "",
   openai: process.env.OPENAI_API_KEY || "",
   segmind: process.env.SEGMIND_API_KEY || "",
+  google: process.env.GOOGLE_AI_API_KEY || "",
 };
 
 app.get("/", (_req, res) => {
@@ -178,6 +179,39 @@ app.post("/mcp", async (req, res) => {
     const videoData = d.data || {};
     const text = videoData.video_url ? `\u2705 Pronto!\nURL: ${videoData.video_url}` : `\u23f3 Stato: ${videoData.status}`;
     return { content: [{ type: "text", text }] };
+  });
+
+  // ===== GEMINI IMAGE (NanoBanana Pro fallback) =====
+  server.registerTool("gemini_generate_image", {
+    title: "Gemini - Genera Immagine (NanoBanana Pro fallback)",
+    description: "Genera immagini con Gemini 2.0 Flash Image — stesso motore di NanoBanana Pro. Usare quando Higgsfield è down.",
+    inputSchema: {
+      prompt: z.string().describe("Descrizione dell'immagine da generare"),
+      aspect_ratio: z.string().default("16:9").describe("Aspect ratio: 1:1, 16:9, 9:16, 4:3"),
+    },
+  }, async ({ prompt, aspect_ratio }) => {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent?key=${KEYS.google}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseModalities: ["TEXT", "IMAGE"],
+          aspectRatio: aspect_ratio,
+        },
+      }),
+    });
+    if (!r.ok) throw new Error(`Gemini error: ${await r.text()}`);
+    const d = await r.json();
+    const parts = d.candidates?.[0]?.content?.parts || [];
+    const imgPart = parts.find(p => p.inlineData);
+    if (!imgPart) {
+      const textPart = parts.find(p => p.text);
+      throw new Error(`Nessuna immagine generata. Risposta: ${textPart?.text || JSON.stringify(d)}`);
+    }
+    const b64 = imgPart.inlineData.data;
+    const mimeType = imgPart.inlineData.mimeType;
+    return { content: [{ type: "text", text: `✅ Immagine generata!\nMimeType: ${mimeType}\nBase64 (prime 100 chars): ${b64.substring(0, 100)}...\nBase64 completo salvato in: data:${mimeType};base64,${b64}` }] };
   });
 
   // ===== SUNO =====
