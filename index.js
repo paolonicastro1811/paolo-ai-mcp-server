@@ -197,7 +197,6 @@ app.post("/mcp", async (req, res) => {
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
           responseModalities: ["TEXT", "IMAGE"],
-          aspectRatio: aspect_ratio,
         },
       }),
     });
