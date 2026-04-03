@@ -49,7 +49,7 @@ app.post("/mcp", async (req, res) => {
       body: JSON.stringify({ text, model_id: "eleven_multilingual_v2", voice_settings: { stability: 0.5, similarity_boost: 0.75 } }),
     });
     if (!r.ok) throw new Error(`ElevenLabs error: ${await r.text()}`);
-    return { content: [{ type: "text", text: `✅ Audio generato con voce ${voice_id} per il testo: "${text.substring(0, 50)}..."` }] };
+    return { content: [{ type: "text", text: `\u2705 Audio generato con voce ${voice_id} per il testo: "${text.substring(0, 50)}..."` }] };
   });
 
   // ===== PERPLEXITY =====
@@ -63,7 +63,11 @@ app.post("/mcp", async (req, res) => {
     const r = await fetch("https://api.perplexity.ai/chat/completions", {
       method: "POST",
       headers: { "Authorization": `Bearer ${KEYS.perplexity}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "sonar", messages: [{ role: "user", content: query }], return_citations: true }),
+      body: JSON.stringify({
+        model: "sonar",
+        messages: [{ role: "user", content: query }],
+        return_citations: true,
+      }),
     });
     if (!r.ok) throw new Error(`Perplexity error: ${await r.text()}`);
     const d = await r.json();
@@ -105,7 +109,7 @@ app.post("/mcp", async (req, res) => {
     });
     if (!r.ok) throw new Error(`DALL-E error: ${await r.text()}`);
     const d = await r.json();
-    return { content: [{ type: "text", text: `🎨 Immagine generata!\nURL: ${d.data[0].url}` }] };
+    return { content: [{ type: "text", text: `\u1f3a8 Immagine generata!\nURL: ${d.data[0].url}` }] };
   });
 
   // ===== HEYGEN (aggiornato a V2) =====
@@ -142,7 +146,7 @@ app.post("/mcp", async (req, res) => {
     });
     if (!r.ok) throw new Error(`HeyGen error: ${await r.text()}`);
     const d = await r.json();
-    return { content: [{ type: "text", text: `🎬 Video in generazione!\nVideo ID: ${d.data.video_id}\nUsa heygen_check_status per monitorare.` }] };
+    return { content: [{ type: "text", text: `\u1f3ac Video in generazione!\nVideo ID: ${d.data.video_id}\nUsa heygen_check_status per monitorare.` }] };
   });
 
   server.registerTool("heygen_check_status", {
@@ -155,7 +159,7 @@ app.post("/mcp", async (req, res) => {
     if (!r.ok) throw new Error(`HeyGen error: ${await r.text()}`);
     const d = await r.json();
     const videoData = d.data || {};
-    const text = videoData.video_url ? `✅ Pronto!\nURL: ${videoData.video_url}` : `⏳ Stato: ${videoData.status}`;
+    const text = videoData.video_url ? `\u2705 Pronto!\nURL: ${videoData.video_url}` : `\u23f3 Stato: ${videoData.status}`;
     return { content: [{ type: "text", text }] };
   });
 
@@ -177,7 +181,7 @@ app.post("/mcp", async (req, res) => {
     });
     if (!r.ok) throw new Error(`Suno error: ${await r.text()}`);
     const d = await r.json();
-    return { content: [{ type: "text", text: `🎵 Musica in generazione!\nTask ID: ${d.id}\nUsa suno_check_status per il risultato.` }] };
+    return { content: [{ type: "text", text: `\u1f3b5 Musica in generazione!\nTask ID: ${d.id}\nUsa suno_check_status per il risultato.` }] };
   });
 
   server.registerTool("suno_check_status", {
@@ -188,7 +192,7 @@ app.post("/mcp", async (req, res) => {
     const r = await fetch(`https://api.acedata.cloud/suno/audios/${task_id}`, { headers: { "Authorization": `Bearer ${KEYS.suno}` } });
     if (!r.ok) throw new Error(`Suno error: ${await r.text()}`);
     const d = await r.json();
-    const text = d.audio_url ? `✅ Pronto!\nURL: ${d.audio_url}` : `⏳ Stato: ${d.status}`;
+    const text = d.audio_url ? `\u2705 Pronto!\nURL: ${d.audio_url}` : `\u23f3 Stato: ${d.status}`;
     return { content: [{ type: "text", text }] };
   });
 
@@ -208,7 +212,7 @@ app.post("/mcp", async (req, res) => {
     });
     if (!r.ok) throw new Error(`Higgsfield error: ${await r.text()}`);
     const d = await r.json();
-    return { content: [{ type: "text", text: `🎬 Video in generazione!\nJob ID: ${d.job_id}\nUsa higgsfield_check_status per monitorare.` }] };
+    return { content: [{ type: "text", text: `\u1f3ac Video in generazione!\nJob ID: ${d.job_id}\nUsa higgsfield_check_status per monitorare.` }] };
   });
 
   server.registerTool("higgsfield_check_status", {
@@ -219,7 +223,7 @@ app.post("/mcp", async (req, res) => {
     const r = await fetch(`https://api.higgsfield.ai/v1/video/status/${job_id}`, { headers: { "Authorization": `Bearer ${KEYS.higgsfield}` } });
     if (!r.ok) throw new Error(`Higgsfield error: ${await r.text()}`);
     const d = await r.json();
-    const text = d.video_url ? `✅ Pronto!\nURL: ${d.video_url}` : `⏳ Stato: ${d.status}`;
+    const text = d.video_url ? `\u2705 Pronto!\nURL: ${d.video_url}` : `\u23f3 Stato: ${d.status}`;
     return { content: [{ type: "text", text }] };
   });
 
@@ -231,7 +235,7 @@ app.post("/mcp", async (req, res) => {
       input_video: z.string().describe("URL del video"),
       input_audio: z.string().describe("URL dell'audio"),
       override_audio: z.boolean().default(true).describe("Sostituisci audio originale"),
-      merge_intensity: z.number().default(0.8).describe("Intensità mix (0-1)"),
+      merge_intensity: z.number().default(0.8).describe("Intensit\u00e0 mix (0-1)"),
     },
   }, async ({ input_video, input_audio, override_audio, merge_intensity }) => {
     const r = await fetch("https://api.segmind.com/v1/video-audio-merge", {
@@ -241,12 +245,12 @@ app.post("/mcp", async (req, res) => {
     });
     if (!r.ok) throw new Error(`Segmind error: ${await r.text()}`);
     const d = await r.json();
-    return { content: [{ type: "text", text: `✅ Video+Audio merged!\nURL: ${d.output_url || d.url || d.output || JSON.stringify(d)}` }] };
+    return { content: [{ type: "text", text: `\u2705 Video+Audio merged!\nURL: ${d.output_url || d.url || d.output || JSON.stringify(d)}` }] };
   });
 
   server.registerTool("segmind_multi_video_merge", {
     title: "Segmind - Multi Video Merge",
-    description: "Unisce più video clip in sequenza.",
+    description: "Unisce pi\u00f9 video clip in sequenza.",
     inputSchema: {
       video_urls: z.array(z.string()).describe("Array URL video (min 2, max 10)"),
       transition_type: z.string().default("fade").describe("Transizione: concat, fade, none"),
@@ -259,7 +263,7 @@ app.post("/mcp", async (req, res) => {
     });
     if (!r.ok) throw new Error(`Segmind error: ${await r.text()}`);
     const d = await r.json();
-    return { content: [{ type: "text", text: `✅ ${video_urls.length} video merged!\nURL: ${d.output_url || d.url || d.output || JSON.stringify(d)}` }] };
+    return { content: [{ type: "text", text: `\u2705 ${video_urls.length} video merged!\nURL: ${d.output_url || d.url || d.output || JSON.stringify(d)}` }] };
   });
 
   // ===== AVVIA SERVER MCP =====
