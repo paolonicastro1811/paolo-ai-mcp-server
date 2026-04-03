@@ -123,7 +123,7 @@ app.post("/mcp", async (req, res) => {
     if (!r.ok) throw new Error(`HeyGen error: ${await r.text()}`);
     const d = await r.json();
     const avatars = d.data?.avatars || [];
-    const text = avatars.slice(0, 20).map(a => `${a.avatar_name} (ID: ${a.avatar_id})`).join("\n");
+    const text = avatars.slice(0, 100).map(a => `${a.avatar_name} (ID: ${a.avatar_id})`).join("\n");
     return { content: [{ type: "text", text: text || "Nessun avatar trovato" }] };
   });
 
@@ -150,13 +150,14 @@ app.post("/mcp", async (req, res) => {
       script_text: z.string().describe("Testo che l'avatar deve pronunciare"),
       avatar_id: z.string().describe("ID dell'avatar"),
       voice_id: z.string().describe("ID della voce"),
+      background_url: z.string().optional().describe("URL immagine di sfondo (opzionale, default colore bianco)"),
     },
-  }, async ({ script_text, avatar_id, voice_id }) => {
+  }, async ({ script_text, avatar_id, voice_id, background_url }) => {
     const r = await fetch("https://api.heygen.com/v2/video/generate", {
       method: "POST",
       headers: { "X-Api-Key": KEYS.heygen, "Content-Type": "application/json" },
       body: JSON.stringify({
-        video_inputs: [{ character: { type: "avatar", avatar_id, avatar_style: "normal" }, voice: { type: "text", input_text: script_text, voice_id }, background: { type: "color", value: "#ffffff" } }],
+        video_inputs: [{ character: { type: "avatar", avatar_id, avatar_style: "normal" }, voice: { type: "text", input_text: script_text, voice_id }, background: background_url ? { type: "image", url: background_url } : { type: "color", value: "#ffffff" } }],
         dimension: { width: 1280, height: 720 },
       }),
     });
