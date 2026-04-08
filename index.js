@@ -351,7 +351,7 @@ app.post("/mcp", async (req, res) => {
 
     // Segmind
     try {
-      const r = await fetch("https://api.segmind.com/users/credits", {
+      const r = await fetch("https://api.segmind.com/v1/get-user-credits", {
         headers: { "x-api-key": KEYS.segmind }
       });
       const d = await r.json();
