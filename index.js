@@ -316,6 +316,94 @@ app.post("/mcp", async (req, res) => {
     return { content: [{ type: "text", text: `\u2705 ${video_urls.length} video merged!\nURL: ${d.output_url || d.url || d.output || JSON.stringify(d)}` }] };
   });
 
+
+  // ===== CHECK CREDITS =====
+  server.registerTool("check_credits", {
+    title: "Check Credits - Report Saldi API",
+    description: "Controlla il credito residuo di tutti i servizi API collegati in un unico report.",
+    inputSchema: {},
+  }, async () => {
+    const results = {};
+
+    // ElevenLabs
+    try {
+      const r = await fetch("https://api.elevenlabs.io/v1/user/subscription", {
+        headers: { "xi-api-key": KEYS.elevenlabs }
+      });
+      const d = await r.json();
+      results.elevenlabs = {
+        status: "✅",
+        plan: d.tier,
+        characters_used: d.character_count,
+        characters_limit: d.character_limit,
+        characters_remaining: d.character_limit - d.character_count,
+      };
+    } catch(e) { results.elevenlabs = { status: "❌", error: e.message }; }
+
+    // HeyGen
+    try {
+      const r = await fetch("https://api.heygen.com/v2/user/remaining_quota", {
+        headers: { "X-Api-Key": KEYS.heygen }
+      });
+      const d = await r.json();
+      results.heygen = { status: "✅", ...(d.data || d) };
+    } catch(e) { results.heygen = { status: "❌", error: e.message }; }
+
+    // Segmind
+    try {
+      const r = await fetch("https://api.segmind.com/users/credits", {
+        headers: { "x-api-key": KEYS.segmind }
+      });
+      const d = await r.json();
+      results.segmind = { status: "✅", ...d };
+    } catch(e) { results.segmind = { status: "❌", error: e.message }; }
+
+    // OpenAI
+    try {
+      const r = await fetch("https://api.openai.com/v1/organizations", {
+        headers: { "Authorization": `Bearer ${KEYS.openai}` }
+      });
+      results.openai = r.ok
+        ? { status: "✅", note: "API attiva — verifica saldo su platform.openai.com/usage" }
+        : { status: "⚠️", note: "API key valida ma saldo non recuperabile via API" };
+    } catch(e) { results.openai = { status: "❌", error: e.message }; }
+
+    // Apify
+    try {
+      const r = await fetch(`https://api.apify.com/v2/users/me?token=${process.env.APIFY_API_KEY || ""}`);
+      const d = await r.json();
+      results.apify = {
+        status: "✅",
+        plan: d.data?.plan?.id,
+        usage_usd: d.data?.monthlyUsage?.totalCostUsd,
+        limit_usd: d.data?.plan?.monthlyUsageLimitUsd,
+      };
+    } catch(e) { results.apify = { status: "❌", error: e.message }; }
+
+    // Higgsfield
+    try {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 5000);
+      const r = await fetch("https://api.higgsfield.ai/v1/user", {
+        headers: { "Authorization": `Bearer ${KEYS.higgsfield}` },
+        signal: controller.signal,
+      });
+      const d = await r.json();
+      results.higgsfield = { status: "✅", ...d };
+    } catch(e) {
+      results.higgsfield = { status: "❌ STILL DOWN", error: "522 Connection Timed Out" };
+    }
+
+    results.suno = { status: "ℹ️", note: "Saldo non disponibile via API — verifica su acedata.cloud" };
+    results.perplexity = { status: "ℹ️", note: "Saldo non disponibile via API — verifica su perplexity.ai/settings" };
+
+    const report = Object.entries(results)
+      .map(([k, v]) => `${v.status} ${k.toUpperCase()}: ${JSON.stringify(v)}`)
+      .join("\n");
+
+    return { content: [{ type: "text", text: `📊 REPORT CREDITI — ${new Date().toISOString()}\n\n${report}` }] };
+  });
+
   // ===== AVVIA SERVER MCP =====
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => { transport.close(); server.close(); });
