@@ -15,6 +15,7 @@ const KEYS = {
   openai: process.env.OPENAI_API_KEY || "",
   segmind: process.env.SEGMIND_API_KEY || "",
   google: process.env.GOOGLE_AI_API_KEY || "",
+  piapi: process.env.PIAPI_API_KEY || "",
 };
 
 app.get("/", (_req, res) => {
@@ -316,6 +317,63 @@ app.post("/mcp", async (req, res) => {
     return { content: [{ type: "text", text: `\u2705 ${video_urls.length} video merged!\nURL: ${d.output_url || d.url || d.output || JSON.stringify(d)}` }] };
   });
 
+
+
+  // ===== KLING (via PiAPI) =====
+  server.registerTool("kling_generate_video", {
+    title: "Kling - Genera Video Cinematografico",
+    description: "Genera video cinematografici realistici con Kling AI via PiAPI. Supporta text-to-video e image-to-video per consistenza personaggio.",
+    inputSchema: {
+      prompt: z.string().describe("Descrizione dettagliata della scena da generare"),
+      image_url: z.string().optional().describe("URL immagine di riferimento per image-to-video (mantiene consistenza personaggio)"),
+      duration: z.number().default(5).describe("Durata in secondi: 5 o 10"),
+      aspect_ratio: z.string().default("16:9").describe("Aspect ratio: 16:9, 9:16, 1:1"),
+      mode: z.string().default("std").describe("Modalità: std ($0.20/5s) o pro ($0.33/5s)"),
+      version: z.string().default("kling-v2-5").describe("Versione modello: kling-v2-5, kling-v2-1, kling-v1-6"),
+    },
+  }, async ({ prompt, image_url, duration, aspect_ratio, mode, version }) => {
+    const input = {
+      prompt,
+      duration,
+      aspect_ratio,
+      mode,
+      cfg_scale: 0.5,
+    };
+    if (image_url) input.image_url = image_url;
+    const r = await fetch("https://api.piapi.ai/api/v1/task", {
+      method: "POST",
+      headers: { "x-api-key": KEYS.piapi, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "kling",
+        task_type: "video_generation",
+        input,
+      }),
+    });
+    if (!r.ok) throw new Error(`Kling error: ${await r.text()}`);
+    const d = await r.json();
+    const taskId = d.data?.task_id;
+    return { content: [{ type: "text", text: `🎬 Video Kling in generazione!\nTask ID: ${taskId}\nModello: ${version} (${mode})\nDurata: ${duration}s\nAspect: ${aspect_ratio}\nCosto stimato: ${mode === "pro" ? (duration === 10 ? "0.66" : "0.33") : (duration === 10 ? "0.40" : "0.20")}\n\nUsa kling_check_status con questo Task ID per monitorare.` }] };
+  });
+
+  server.registerTool("kling_check_status", {
+    title: "Kling - Controlla Stato Video",
+    description: "Controlla lo stato di un task Kling e ottieni l'URL del video quando pronto.",
+    inputSchema: {
+      task_id: z.string().describe("Task ID ottenuto da kling_generate_video"),
+    },
+  }, async ({ task_id }) => {
+    const r = await fetch(`https://api.piapi.ai/api/v1/task/${task_id}`, {
+      headers: { "x-api-key": KEYS.piapi },
+    });
+    if (!r.ok) throw new Error(`Kling error: ${await r.text()}`);
+    const d = await r.json();
+    const status = d.data?.status;
+    const videoUrl = d.data?.output?.video_url;
+    if (videoUrl) {
+      return { content: [{ type: "text", text: `✅ Video Kling pronto!\nURL: ${videoUrl}\nTask ID: ${task_id}` }] };
+    }
+    return { content: [{ type: "text", text: `⏳ Stato: ${status}\nTask ID: ${task_id}\nRiprova tra 30-60 secondi.` }] };
+  });
 
   // ===== CHECK CREDITS =====
   server.registerTool("check_credits", {
