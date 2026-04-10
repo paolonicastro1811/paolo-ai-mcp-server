@@ -32,6 +32,31 @@ const CLAUDE_NATIVE_MIMES = new Set([
   "image/webp",
 ]);
 
+// Mappatura estensione -> MIME type per il fallback quando Gmail dichiara
+// "application/octet-stream" o un MIME generico inaffidabile.
+const EXTENSION_MIME_MAP = {
+  pdf: "application/pdf",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+};
+
+/**
+ * Risolve il MIME type effettivo di un allegato Gmail. Se Gmail dichiara
+ * un MIME generico ("application/octet-stream", "binary/octet-stream",
+ * stringa vuota), proviamo a dedurlo dall'estensione del filename.
+ */
+function resolveMimeType(declaredMime, filename) {
+  const trustworthy = declaredMime
+    && declaredMime !== "application/octet-stream"
+    && declaredMime !== "binary/octet-stream";
+  if (trustworthy) return declaredMime;
+  const ext = (filename.split(".").pop() || "").toLowerCase();
+  return EXTENSION_MIME_MAP[ext] || declaredMime || "application/octet-stream";
+}
+
 // ============================================================
 // GOOGLE WORKSPACE — Helper condivisi (import dinamico)
 // ============================================================
@@ -132,11 +157,11 @@ function base64urlToBuffer(base64url) {
 // ============================================================
 
 app.get("/", (_req, res) => {
-  res.json({ status: "ok", server: "Paolo AI MCP Server", version: "2.1.0" });
+  res.json({ status: "ok", server: "Paolo AI MCP Server", version: "2.1.1" });
 });
 
 app.post("/mcp", async (req, res) => {
-  const server = new McpServer({ name: "paolo-ai-mcp-server", version: "2.1.0" });
+  const server = new McpServer({ name: "paolo-ai-mcp-server", version: "2.1.1" });
 
   // ===== ELEVENLABS =====
   server.registerTool("elevenlabs_list_voices", {
@@ -675,7 +700,8 @@ app.post("/mcp", async (req, res) => {
       });
       const allAtts = extractGmailAttachments(msgMeta.data.payload);
       const matched = allAtts.find(a => a.attachmentId === attachment_id);
-      const mimeType = matched?.mimeType || "application/octet-stream";
+      const declaredMime = matched?.mimeType || "application/octet-stream";
+      const mimeType = resolveMimeType(declaredMime, filename);
 
       // Base64 standard (non base64url) per il protocollo MCP
       const base64Standard = buffer.toString("base64");
