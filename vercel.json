@@ -1,0 +1,8 @@
+{
+     "crons": [
+       {
+         "path": "/cleanup-blobs?secret=a3eec621808a712713c317c116d43f2ee4ae351b53409e51960df3fd1fbe444c&max_age_hours=24",
+         "schedule": "0 3 * * *"
+       }
+     ]
+   }
