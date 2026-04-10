@@ -18,45 +18,6 @@ const KEYS = {
   piapi: process.env.PIAPI_API_KEY || "",
 };
 
-// Limite dimensione allegato Gmail ritornato inline come base64.
-// Sopra questo limite il tool ritorna errore invece di riempire il contesto.
-const GMAIL_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024; // 20 MB
-
-// MIME type che Claude può leggere nativamente quando ritornati come resource
-// con blob base64 (PDF + immagini standard).
-const CLAUDE_NATIVE_MIMES = new Set([
-  "application/pdf",
-  "image/png",
-  "image/jpeg",
-  "image/gif",
-  "image/webp",
-]);
-
-// Mappatura estensione -> MIME type per il fallback quando Gmail dichiara
-// "application/octet-stream" o un MIME generico inaffidabile.
-const EXTENSION_MIME_MAP = {
-  pdf: "application/pdf",
-  png: "image/png",
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  gif: "image/gif",
-  webp: "image/webp",
-};
-
-/**
- * Risolve il MIME type effettivo di un allegato Gmail. Se Gmail dichiara
- * un MIME generico ("application/octet-stream", "binary/octet-stream",
- * stringa vuota), proviamo a dedurlo dall'estensione del filename.
- */
-function resolveMimeType(declaredMime, filename) {
-  const trustworthy = declaredMime
-    && declaredMime !== "application/octet-stream"
-    && declaredMime !== "binary/octet-stream";
-  if (trustworthy) return declaredMime;
-  const ext = (filename.split(".").pop() || "").toLowerCase();
-  return EXTENSION_MIME_MAP[ext] || declaredMime || "application/octet-stream";
-}
-
 // ============================================================
 // GOOGLE WORKSPACE — Helper condivisi (import dinamico)
 // ============================================================
@@ -129,8 +90,8 @@ function extractGmailAttachments(payload, attachments = []) {
 /**
  * Carica un buffer su Vercel Blob come file pubblico e ritorna l'URL.
  * Il nome file viene sanitizzato e prefissato con timestamp.
- * NOTA: usato ancora da drive_download_file e drive_export_google_file
- * (da sistemare in un deploy successivo).
+ * I blob vengono automaticamente eliminati dopo 24h dal cron job
+ * POST /cleanup-blobs (vedi vercel.json).
  */
 async function uploadBufferToBlob(buffer, filename, folder = "gmail-attachments") {
   const { put } = await loadBlob();
@@ -157,11 +118,11 @@ function base64urlToBuffer(base64url) {
 // ============================================================
 
 app.get("/", (_req, res) => {
-  res.json({ status: "ok", server: "Paolo AI MCP Server", version: "2.1.1" });
+  res.json({ status: "ok", server: "Paolo AI MCP Server", version: "2.2.0" });
 });
 
 app.post("/mcp", async (req, res) => {
-  const server = new McpServer({ name: "paolo-ai-mcp-server", version: "2.1.1" });
+  const server = new McpServer({ name: "paolo-ai-mcp-server", version: "2.2.0" });
 
   // ===== ELEVENLABS =====
   server.registerTool("elevenlabs_list_voices", {
@@ -646,110 +607,30 @@ app.post("/mcp", async (req, res) => {
     }
   });
 
-  // === gmail_download_attachment — VERSIONE INLINE BASE64 ===
-  // Scarica l'allegato da Gmail e lo ritorna direttamente come contenuto
-  // MCP "resource" con blob base64, senza passare per Vercel Blob.
-  // Claude legge nativamente PDF e immagini ricevuti in questo modo.
   server.registerTool("gmail_download_attachment", {
-    title: "Gmail - Scarica Allegato (inline)",
-    description: "Scarica un allegato da un'email Gmail e lo restituisce direttamente inline come resource base64. Claude può leggere nativamente PDF, PNG, JPEG, GIF e WebP. Per altri formati (Excel, ZIP, ecc.) ritorna metadati + base64 ma senza rendering nativo. Nessun URL pubblico generato: i dati restano privati nella conversazione.",
+    title: "Gmail - Scarica Allegato",
+    description: "Scarica un allegato specifico da un'email Gmail, lo carica su Vercel Blob (store pubblico con cleanup automatico dopo 24h), e restituisce un URL pubblico fetchabile. Claude può poi usare web_fetch su questo URL per leggere il contenuto del file (PDF, immagini, Excel, ecc.).",
     inputSchema: {
       message_id: z.string().describe("ID del messaggio Gmail"),
       attachment_id: z.string().describe("ID dell'allegato (da gmail_list_attachments)"),
-      filename: z.string().describe("Nome file originale"),
+      filename: z.string().describe("Nome file originale (usato per l'URL pubblico)"),
     },
   }, async ({ message_id, attachment_id, filename }) => {
     try {
       const google = await loadGoogleapis();
       const auth = await getGoogleAuth();
       const gmail = google.gmail({ version: "v1", auth });
-
-      // Scarica il contenuto dell'allegato (base64url)
       const att = await gmail.users.messages.attachments.get({
         userId: "me",
         messageId: message_id,
         id: attachment_id,
       });
-      if (!att.data.data) {
-        throw new Error("Nessun dato ricevuto da Gmail per questo allegato");
-      }
-
-      // Decodifica base64url -> Buffer per calcolare dimensione e validare
+      if (!att.data.data) throw new Error("Nessun dato ricevuto da Gmail per questo allegato");
       const buffer = base64urlToBuffer(att.data.data);
-      const sizeBytes = buffer.length;
-      const sizeKB = (sizeBytes / 1024).toFixed(1);
-      const sizeMB = (sizeBytes / 1024 / 1024).toFixed(2);
-
-      // Controllo limite dimensione
-      if (sizeBytes > GMAIL_ATTACHMENT_MAX_BYTES) {
-        const limitMB = (GMAIL_ATTACHMENT_MAX_BYTES / 1024 / 1024).toFixed(0);
-        return {
-          content: [{
-            type: "text",
-            text: `❌ Allegato troppo grande per ritorno inline.\n\n📄 File: ${filename}\n📊 Dimensione: ${sizeMB} MB\n⚠️ Limite: ${limitMB} MB\n\nPer file oltre il limite, scarica manualmente da Gmail.`
-          }],
-          isError: true,
-        };
-      }
-
-      // Ricava il mimeType dal messaggio Gmail (più affidabile dell'estensione)
-      const msgMeta = await gmail.users.messages.get({
-        userId: "me",
-        id: message_id,
-        format: "full",
-      });
-      const allAtts = extractGmailAttachments(msgMeta.data.payload);
-      const matched = allAtts.find(a => a.attachmentId === attachment_id);
-      const declaredMime = matched?.mimeType || "application/octet-stream";
-      const mimeType = resolveMimeType(declaredMime, filename);
-
-      // Base64 standard (non base64url) per il protocollo MCP
-      const base64Standard = buffer.toString("base64");
-
-      // Se è un formato che Claude sa leggere nativamente, ritornalo
-      // come resource embedded -> Claude lo processa come un upload.
-      if (CLAUDE_NATIVE_MIMES.has(mimeType)) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `✅ Allegato scaricato inline\n\n📄 ${filename}\n📊 ${sizeKB} KB\n🏷️ ${mimeType}\n\nIl file è allegato qui sotto per la lettura diretta.`,
-            },
-            {
-              type: "resource",
-              resource: {
-                uri: `gmail://message/${message_id}/attachment/${attachment_id}/${encodeURIComponent(filename)}`,
-                mimeType,
-                blob: base64Standard,
-              },
-            },
-          ],
-        };
-      }
-
-      // Formato non nativo: ritorna i metadati e il base64 in un resource
-      // comunque, così chi riceve può decidere cosa farne.
-      return {
-        content: [
-          {
-            type: "text",
-            text: `⚠️ Allegato scaricato ma formato non visualizzabile nativamente\n\n📄 ${filename}\n📊 ${sizeKB} KB\n🏷️ ${mimeType}\n\nI dati sono allegati come resource base64 ma Claude non può leggerli direttamente. Formati supportati nativamente: PDF, PNG, JPEG, GIF, WebP.`,
-          },
-          {
-            type: "resource",
-            resource: {
-              uri: `gmail://message/${message_id}/attachment/${attachment_id}/${encodeURIComponent(filename)}`,
-              mimeType,
-              blob: base64Standard,
-            },
-          },
-        ],
-      };
+      const url = await uploadBufferToBlob(buffer, filename, "gmail-attachments");
+      return { content: [{ type: "text", text: `✅ Allegato scaricato\n\n📄 File: ${filename}\n📊 Dimensione: ${(buffer.length / 1024).toFixed(1)} KB\n🔗 URL: ${url}\n\nUsa web_fetch su questo URL per leggere il contenuto.\n\n⚠️ Il file sarà automaticamente eliminato entro 24h dal cron job di cleanup.` }] };
     } catch (err) {
-      return {
-        content: [{ type: "text", text: `❌ Gmail download error: ${err.message}` }],
-        isError: true,
-      };
+      return { content: [{ type: "text", text: `❌ Gmail download error: ${err.message}` }], isError: true };
     }
   });
 
@@ -1081,6 +962,99 @@ app.post("/mcp", async (req, res) => {
 
 app.get("/mcp", (_req, res) => {
   res.status(405).json({ error: "Use POST." });
+});
+
+// ============================================================
+// CLEANUP BLOBS — Eliminazione automatica dei file vecchi
+// ============================================================
+// Può essere chiamato in due modi:
+//  1) POST /cleanup-blobs con header "Authorization: Bearer <CLEANUP_SECRET>"
+//     (uso manuale / da altri servizi)
+//  2) GET  /cleanup-blobs?secret=<CLEANUP_SECRET>
+//     (usato dal Cron Job Vercel, vedi vercel.json — i cron Vercel
+//     non possono passare header custom, solo query string)
+//
+// Elimina tutti i blob più vecchi di max_age_hours (default 24)
+// nelle cartelle gmail-attachments/, drive-files/, drive-exports/.
+// ============================================================
+
+async function runCleanup(maxAgeHours) {
+  const cutoffMs = Date.now() - maxAgeHours * 3600 * 1000;
+  const prefixes = ["gmail-attachments/", "drive-files/", "drive-exports/"];
+
+  const summary = {
+    started_at: new Date().toISOString(),
+    max_age_hours: maxAgeHours,
+    cutoff: new Date(cutoffMs).toISOString(),
+    deleted: [],
+    errors: [],
+    total_scanned: 0,
+    total_deleted: 0,
+  };
+
+  const { list, del } = await loadBlob();
+
+  for (const prefix of prefixes) {
+    let cursor = undefined;
+    do {
+      const page = await list({ prefix, cursor, limit: 1000 });
+      for (const blob of page.blobs) {
+        summary.total_scanned += 1;
+        const uploadedAt = new Date(blob.uploadedAt).getTime();
+        if (uploadedAt < cutoffMs) {
+          try {
+            await del(blob.url);
+            summary.deleted.push({ pathname: blob.pathname, uploadedAt: blob.uploadedAt });
+            summary.total_deleted += 1;
+          } catch (e) {
+            summary.errors.push({ pathname: blob.pathname, error: e.message });
+          }
+        }
+      }
+      cursor = page.cursor;
+    } while (cursor);
+  }
+
+  summary.finished_at = new Date().toISOString();
+  return summary;
+}
+
+// POST /cleanup-blobs — uso manuale con header Bearer
+app.post("/cleanup-blobs", async (req, res) => {
+  const authHeader = req.headers["authorization"] || "";
+  const expectedSecret = process.env.CLEANUP_SECRET;
+  if (!expectedSecret) {
+    return res.status(500).json({ error: "CLEANUP_SECRET non configurato sulle env var" });
+  }
+  if (authHeader !== `Bearer ${expectedSecret}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const maxAgeHours = Number(req.body?.max_age_hours ?? 24);
+  try {
+    const summary = await runCleanup(maxAgeHours);
+    return res.json(summary);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /cleanup-blobs?secret=... — usato dal Cron Vercel
+app.get("/cleanup-blobs", async (req, res) => {
+  const expectedSecret = process.env.CLEANUP_SECRET;
+  if (!expectedSecret) {
+    return res.status(500).json({ error: "CLEANUP_SECRET non configurato sulle env var" });
+  }
+  const providedSecret = req.query?.secret || "";
+  if (providedSecret !== expectedSecret) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const maxAgeHours = Number(req.query?.max_age_hours ?? 24);
+  try {
+    const summary = await runCleanup(maxAgeHours);
+    return res.json(summary);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
