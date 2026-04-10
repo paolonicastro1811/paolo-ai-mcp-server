@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 const KEYS = {
   elevenlabs: process.env.ELEVENLABS_API_KEY || "",
@@ -18,12 +18,109 @@ const KEYS = {
   piapi: process.env.PIAPI_API_KEY || "",
 };
 
+// ============================================================
+// GOOGLE WORKSPACE — Helper condivisi (import dinamico)
+// ============================================================
+// googleapis e @vercel/blob sono pesanti: li carichiamo solo
+// quando un tool Google viene effettivamente chiamato.
+// ============================================================
+
+let _googleapisCache = null;
+let _blobCache = null;
+
+async function loadGoogleapis() {
+  if (!_googleapisCache) {
+    const mod = await import("googleapis");
+    _googleapisCache = mod.google;
+  }
+  return _googleapisCache;
+}
+
+async function loadBlob() {
+  if (!_blobCache) {
+    _blobCache = await import("@vercel/blob");
+  }
+  return _blobCache;
+}
+
+/**
+ * Crea un client OAuth2 Google autenticato usando il refresh token
+ * salvato nelle env var. Ritorna un oggetto auth pronto da passare
+ * ai costruttori dei servizi Google (gmail, drive, sheets, ecc.).
+ */
+async function getGoogleAuth() {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error(
+      "Google credentials mancanti. Verifica GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN su Vercel."
+    );
+  }
+
+  const google = await loadGoogleapis();
+  const oauth2Client = new google.auth.OAuth2(clientId, clientSecret);
+  oauth2Client.setCredentials({ refresh_token: refreshToken });
+  return oauth2Client;
+}
+
+/**
+ * Estrae ricorsivamente tutti gli allegati da un payload Gmail.
+ * Gmail annida gli allegati in payload.parts (a volte più livelli).
+ */
+function extractGmailAttachments(payload, attachments = []) {
+  if (!payload) return attachments;
+  if (payload.filename && payload.filename.length > 0 && payload.body?.attachmentId) {
+    attachments.push({
+      filename: payload.filename,
+      mimeType: payload.mimeType,
+      size: payload.body.size,
+      attachmentId: payload.body.attachmentId,
+    });
+  }
+  if (payload.parts && Array.isArray(payload.parts)) {
+    for (const part of payload.parts) {
+      extractGmailAttachments(part, attachments);
+    }
+  }
+  return attachments;
+}
+
+/**
+ * Carica un buffer su Vercel Blob come file pubblico e ritorna l'URL.
+ * Il nome file viene sanitizzato e prefissato con timestamp.
+ */
+async function uploadBufferToBlob(buffer, filename, folder = "gmail-attachments") {
+  const { put } = await loadBlob();
+  const timestamp = Date.now();
+  const safeFilename = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const blobPath = `${folder}/${timestamp}-${safeFilename}`;
+  const blob = await put(blobPath, buffer, {
+    access: "public",
+    addRandomSuffix: false,
+  });
+  return blob.url;
+}
+
+/**
+ * Converte una stringa base64url (usata da Gmail) in Buffer.
+ */
+function base64urlToBuffer(base64url) {
+  const base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
+  return Buffer.from(base64, "base64");
+}
+
+// ============================================================
+// ROUTES
+// ============================================================
+
 app.get("/", (_req, res) => {
-  res.json({ status: "ok", server: "Paolo AI MCP Server", version: "1.0.0" });
+  res.json({ status: "ok", server: "Paolo AI MCP Server", version: "2.0.0" });
 });
 
 app.post("/mcp", async (req, res) => {
-  const server = new McpServer({ name: "paolo-ai-mcp-server", version: "1.0.0" });
+  const server = new McpServer({ name: "paolo-ai-mcp-server", version: "2.0.0" });
 
   // ===== ELEVENLABS =====
   server.registerTool("elevenlabs_list_voices", {
@@ -120,7 +217,6 @@ app.post("/mcp", async (req, res) => {
     description: "Elenca gli avatar disponibili su HeyGen.",
     inputSchema: {},
   }, async () => {
-    // FIX V2: era /v1/avatar.list
     const r = await fetch("https://api.heygen.com/v2/avatars", { headers: { "X-Api-Key": KEYS.heygen } });
     if (!r.ok) throw new Error(`HeyGen error: ${await r.text()}`);
     const d = await r.json();
@@ -173,7 +269,6 @@ app.post("/mcp", async (req, res) => {
     description: "Controlla lo stato di un video HeyGen.",
     inputSchema: { video_id: z.string().describe("ID del video") },
   }, async ({ video_id }) => {
-    // FIX V2: era /v1/video_status.get?video_id=...
     const r = await fetch(`https://api.heygen.com/v2/videos/${video_id}`, { headers: { "X-Api-Key": KEYS.heygen } });
     if (!r.ok) throw new Error(`HeyGen error: ${await r.text()}`);
     const d = await r.json();
@@ -317,8 +412,6 @@ app.post("/mcp", async (req, res) => {
     return { content: [{ type: "text", text: `\u2705 ${video_urls.length} video merged!\nURL: ${d.output_url || d.url || d.output || JSON.stringify(d)}` }] };
   });
 
-
-
   // ===== KLING (via PiAPI) =====
   server.registerTool("kling_generate_video", {
     title: "Kling - Genera Video Cinematografico",
@@ -383,7 +476,6 @@ app.post("/mcp", async (req, res) => {
   }, async () => {
     const results = {};
 
-    // ElevenLabs
     try {
       const r = await fetch("https://api.elevenlabs.io/v1/user/subscription", {
         headers: { "xi-api-key": KEYS.elevenlabs }
@@ -398,7 +490,6 @@ app.post("/mcp", async (req, res) => {
       };
     } catch(e) { results.elevenlabs = { status: "❌", error: e.message }; }
 
-    // HeyGen
     try {
       const r = await fetch("https://api.heygen.com/v2/user/remaining_quota", {
         headers: { "X-Api-Key": KEYS.heygen }
@@ -407,7 +498,6 @@ app.post("/mcp", async (req, res) => {
       results.heygen = { status: "✅", ...(d.data || d) };
     } catch(e) { results.heygen = { status: "❌", error: e.message }; }
 
-    // Segmind
     try {
       const r = await fetch("https://api.segmind.com/v1/get-user-credits", {
         headers: { "x-api-key": KEYS.segmind }
@@ -416,7 +506,6 @@ app.post("/mcp", async (req, res) => {
       results.segmind = { status: "✅", ...d };
     } catch(e) { results.segmind = { status: "❌", error: e.message }; }
 
-    // OpenAI
     try {
       const r = await fetch("https://api.openai.com/v1/organizations", {
         headers: { "Authorization": `Bearer ${KEYS.openai}` }
@@ -426,7 +515,6 @@ app.post("/mcp", async (req, res) => {
         : { status: "⚠️", note: "API key valida ma saldo non recuperabile via API" };
     } catch(e) { results.openai = { status: "❌", error: e.message }; }
 
-    // Apify
     try {
       const r = await fetch(`https://api.apify.com/v2/users/me?token=${process.env.APIFY_API_KEY || ""}`);
       const d = await r.json();
@@ -438,7 +526,6 @@ app.post("/mcp", async (req, res) => {
       };
     } catch(e) { results.apify = { status: "❌", error: e.message }; }
 
-    // Higgsfield
     try {
       const controller = new AbortController();
       setTimeout(() => controller.abort(), 5000);
@@ -460,6 +547,408 @@ app.post("/mcp", async (req, res) => {
       .join("\n");
 
     return { content: [{ type: "text", text: `📊 REPORT CREDITI — ${new Date().toISOString()}\n\n${report}` }] };
+  });
+
+  // ============================================================
+  // ===== GOOGLE WORKSPACE TOOLS =====
+  // ============================================================
+
+  // ----- DIAGNOSTICA -----
+  server.registerTool("google_test_auth", {
+    title: "Google - Test Autenticazione",
+    description: "Verifica che le credenziali Google OAuth siano valide e restituisce email dell'account e scope autorizzati. Usa questo tool per diagnosticare problemi di autenticazione.",
+    inputSchema: {},
+  }, async () => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const oauth2 = google.oauth2({ version: "v2", auth });
+      const userInfo = await oauth2.userinfo.get();
+      const tokenInfo = await auth.getAccessToken();
+      return {
+        content: [{
+          type: "text",
+          text: `✅ Google OAuth OK\n\nAccount: ${userInfo.data.email}\nNome: ${userInfo.data.name}\nAccess token ottenuto: ${tokenInfo.token ? "sì" : "no"}\n\nLe credenziali funzionano correttamente.`
+        }]
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `❌ Errore autenticazione Google: ${err.message}` }],
+        isError: true
+      };
+    }
+  });
+
+  // ----- GMAIL -----
+  server.registerTool("gmail_list_attachments", {
+    title: "Gmail - Elenca Allegati",
+    description: "Elenca tutti gli allegati di un'email Gmail dato il messageId. Restituisce filename, mimeType, size e attachmentId per ciascun allegato. Usa poi gmail_download_attachment per scaricarne uno.",
+    inputSchema: {
+      message_id: z.string().describe("ID del messaggio Gmail (es. 19c8c548c0c40869)"),
+    },
+  }, async ({ message_id }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const gmail = google.gmail({ version: "v1", auth });
+      const msg = await gmail.users.messages.get({ userId: "me", id: message_id, format: "full" });
+      const attachments = extractGmailAttachments(msg.data.payload);
+      if (attachments.length === 0) {
+        return { content: [{ type: "text", text: `Nessun allegato trovato nel messaggio ${message_id}.` }] };
+      }
+      const summary = attachments.map((a, i) =>
+        `${i + 1}. ${a.filename}\n   mimeType: ${a.mimeType}\n   size: ${(a.size / 1024).toFixed(1)} KB\n   attachmentId: ${a.attachmentId}`
+      ).join("\n\n");
+      return { content: [{ type: "text", text: `📎 ${attachments.length} allegati nel messaggio ${message_id}:\n\n${summary}\n\nUsa gmail_download_attachment con message_id + attachment_id + filename per scaricare.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Gmail error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("gmail_download_attachment", {
+    title: "Gmail - Scarica Allegato",
+    description: "Scarica un allegato specifico da un'email Gmail, lo carica su Vercel Blob, e restituisce un URL pubblico fetchabile. Claude può poi usare web_fetch su questo URL per leggere il contenuto del file (PDF, immagini, Excel, ecc.).",
+    inputSchema: {
+      message_id: z.string().describe("ID del messaggio Gmail"),
+      attachment_id: z.string().describe("ID dell'allegato (da gmail_list_attachments)"),
+      filename: z.string().describe("Nome file originale (usato per l'URL pubblico)"),
+    },
+  }, async ({ message_id, attachment_id, filename }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const gmail = google.gmail({ version: "v1", auth });
+      const att = await gmail.users.messages.attachments.get({
+        userId: "me",
+        messageId: message_id,
+        id: attachment_id,
+      });
+      if (!att.data.data) throw new Error("Nessun dato ricevuto da Gmail per questo allegato");
+      const buffer = base64urlToBuffer(att.data.data);
+      const url = await uploadBufferToBlob(buffer, filename, "gmail-attachments");
+      return { content: [{ type: "text", text: `✅ Allegato scaricato\n\n📄 File: ${filename}\n📊 Dimensione: ${(buffer.length / 1024).toFixed(1)} KB\n🔗 URL: ${url}\n\nUsa web_fetch su questo URL per leggere il contenuto.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Gmail download error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("gmail_send_message", {
+    title: "Gmail - Invia Email",
+    description: "Invia un'email dal tuo account Gmail. Supporta destinatari multipli, CC, BCC, e corpo in testo semplice o HTML.",
+    inputSchema: {
+      to: z.string().describe("Destinatario/i, separati da virgola se multipli"),
+      subject: z.string().describe("Oggetto dell'email"),
+      body: z.string().describe("Corpo dell'email (testo o HTML)"),
+      cc: z.string().optional().describe("CC (opzionale, separati da virgola)"),
+      bcc: z.string().optional().describe("BCC (opzionale, separati da virgola)"),
+      is_html: z.boolean().default(false).describe("True se body è HTML, false per testo"),
+    },
+  }, async ({ to, subject, body, cc, bcc, is_html }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const gmail = google.gmail({ version: "v1", auth });
+      const headers = [
+        `To: ${to}`,
+        cc ? `Cc: ${cc}` : null,
+        bcc ? `Bcc: ${bcc}` : null,
+        `Subject: =?UTF-8?B?${Buffer.from(subject).toString("base64")}?=`,
+        "MIME-Version: 1.0",
+        is_html ? "Content-Type: text/html; charset=UTF-8" : "Content-Type: text/plain; charset=UTF-8",
+      ].filter(Boolean).join("\r\n");
+      const rawMessage = `${headers}\r\n\r\n${body}`;
+      const encodedMessage = Buffer.from(rawMessage).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      const result = await gmail.users.messages.send({
+        userId: "me",
+        requestBody: { raw: encodedMessage },
+      });
+      return { content: [{ type: "text", text: `✅ Email inviata\nMessage ID: ${result.data.id}\nA: ${to}\nOggetto: ${subject}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Gmail send error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("gmail_create_draft", {
+    title: "Gmail - Crea Bozza",
+    description: "Crea una bozza email nel tuo account Gmail senza inviarla. Utile per preparare email che poi invierai manualmente.",
+    inputSchema: {
+      to: z.string().describe("Destinatario"),
+      subject: z.string().describe("Oggetto"),
+      body: z.string().describe("Corpo (testo o HTML)"),
+      is_html: z.boolean().default(false).describe("True se HTML"),
+    },
+  }, async ({ to, subject, body, is_html }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const gmail = google.gmail({ version: "v1", auth });
+      const headers = [
+        `To: ${to}`,
+        `Subject: =?UTF-8?B?${Buffer.from(subject).toString("base64")}?=`,
+        "MIME-Version: 1.0",
+        is_html ? "Content-Type: text/html; charset=UTF-8" : "Content-Type: text/plain; charset=UTF-8",
+      ].join("\r\n");
+      const rawMessage = `${headers}\r\n\r\n${body}`;
+      const encodedMessage = Buffer.from(rawMessage).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      const result = await gmail.users.drafts.create({
+        userId: "me",
+        requestBody: { message: { raw: encodedMessage } },
+      });
+      return { content: [{ type: "text", text: `✅ Bozza creata\nDraft ID: ${result.data.id}\nA: ${to}\nOggetto: ${subject}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Gmail draft error: ${err.message}` }], isError: true };
+    }
+  });
+
+  // ----- GOOGLE DRIVE -----
+  server.registerTool("drive_download_file", {
+    title: "Drive - Scarica File",
+    description: "Scarica un file da Google Drive (qualsiasi formato: PDF, Excel, Word, immagini, ZIP) e lo carica su Vercel Blob, restituendo un URL pubblico. Per Google Docs/Sheets/Slides usa drive_export_google_file.",
+    inputSchema: {
+      file_id: z.string().describe("ID del file su Drive"),
+      filename: z.string().optional().describe("Nome file da usare (se omesso, usa il nome su Drive)"),
+    },
+  }, async ({ file_id, filename }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const drive = google.drive({ version: "v3", auth });
+      const meta = await drive.files.get({ fileId: file_id, fields: "name,mimeType,size" });
+      if (meta.data.mimeType?.startsWith("application/vnd.google-apps")) {
+        return { content: [{ type: "text", text: `⚠️ Questo è un file Google nativo (${meta.data.mimeType}). Usa drive_export_google_file per esportarlo in PDF/Excel/Word.` }], isError: true };
+      }
+      const fileResp = await drive.files.get({ fileId: file_id, alt: "media" }, { responseType: "arraybuffer" });
+      const buffer = Buffer.from(fileResp.data);
+      const finalName = filename || meta.data.name || `drive_${file_id}`;
+      const url = await uploadBufferToBlob(buffer, finalName, "drive-files");
+      return { content: [{ type: "text", text: `✅ File Drive scaricato\n\n📄 ${meta.data.name}\n📊 ${(buffer.length / 1024).toFixed(1)} KB\n🔗 ${url}\n\nUsa web_fetch su questo URL per leggere il contenuto.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Drive download error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("drive_export_google_file", {
+    title: "Drive - Esporta File Google",
+    description: "Esporta un file Google nativo (Docs, Sheets, Slides) in un formato standard (PDF, XLSX, DOCX, PPTX) e lo carica su Blob. Per file non-Google usa drive_download_file.",
+    inputSchema: {
+      file_id: z.string().describe("ID del file Google Doc/Sheet/Slides"),
+      export_format: z.string().default("pdf").describe("Formato: pdf, xlsx, docx, pptx, csv, txt, html"),
+    },
+  }, async ({ file_id, export_format }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const drive = google.drive({ version: "v3", auth });
+      const meta = await drive.files.get({ fileId: file_id, fields: "name,mimeType" });
+      const mimeMap = {
+        pdf: "application/pdf",
+        xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        csv: "text/csv",
+        txt: "text/plain",
+        html: "text/html",
+      };
+      const targetMime = mimeMap[export_format.toLowerCase()];
+      if (!targetMime) throw new Error(`Formato non supportato: ${export_format}. Usa: pdf, xlsx, docx, pptx, csv, txt, html`);
+      const exportResp = await drive.files.export({ fileId: file_id, mimeType: targetMime }, { responseType: "arraybuffer" });
+      const buffer = Buffer.from(exportResp.data);
+      const safeName = (meta.data.name || "export").replace(/[^a-zA-Z0-9._-]/g, "_");
+      const filename = `${safeName}.${export_format.toLowerCase()}`;
+      const url = await uploadBufferToBlob(buffer, filename, "drive-exports");
+      return { content: [{ type: "text", text: `✅ File Google esportato in ${export_format.toUpperCase()}\n\n📄 ${meta.data.name} → ${filename}\n📊 ${(buffer.length / 1024).toFixed(1)} KB\n🔗 ${url}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Drive export error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("drive_list_folder", {
+    title: "Drive - Elenca Contenuto Cartella",
+    description: "Elenca file e sottocartelle di una cartella Google Drive. Per la root usa 'root' come folder_id.",
+    inputSchema: {
+      folder_id: z.string().default("root").describe("ID cartella (usa 'root' per la root del Drive)"),
+      max_results: z.number().default(50).describe("Numero massimo di risultati (max 1000)"),
+    },
+  }, async ({ folder_id, max_results }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const drive = google.drive({ version: "v3", auth });
+      const resp = await drive.files.list({
+        q: `'${folder_id}' in parents and trashed = false`,
+        pageSize: max_results,
+        fields: "files(id,name,mimeType,size,modifiedTime)",
+        orderBy: "modifiedTime desc",
+      });
+      const files = resp.data.files || [];
+      if (files.length === 0) return { content: [{ type: "text", text: `Nessun file in cartella ${folder_id}` }] };
+      const text = files.map(f => {
+        const isFolder = f.mimeType === "application/vnd.google-apps.folder";
+        const sizeStr = f.size ? `${(f.size / 1024).toFixed(1)} KB` : "—";
+        return `${isFolder ? "📁" : "📄"} ${f.name}\n   id: ${f.id}\n   mime: ${f.mimeType}\n   size: ${sizeStr}\n   modified: ${f.modifiedTime}`;
+      }).join("\n\n");
+      return { content: [{ type: "text", text: `📂 ${files.length} elementi in cartella ${folder_id}:\n\n${text}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Drive list error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("drive_search", {
+    title: "Drive - Ricerca Avanzata",
+    description: "Cerca file su Google Drive con query avanzata (full-text + filtri). Esempi: 'name contains \"polizza\"', 'mimeType = \"application/pdf\"', 'modifiedTime > \"2026-01-01\"'.",
+    inputSchema: {
+      query: z.string().describe("Query Drive API (vedi https://developers.google.com/drive/api/guides/search-files)"),
+      max_results: z.number().default(20).describe("Numero massimo risultati"),
+    },
+  }, async ({ query, max_results }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const drive = google.drive({ version: "v3", auth });
+      const resp = await drive.files.list({
+        q: query,
+        pageSize: max_results,
+        fields: "files(id,name,mimeType,size,modifiedTime,webViewLink)",
+        orderBy: "modifiedTime desc",
+      });
+      const files = resp.data.files || [];
+      if (files.length === 0) return { content: [{ type: "text", text: `Nessun risultato per query: ${query}` }] };
+      const text = files.map(f => `📄 ${f.name}\n   id: ${f.id}\n   mime: ${f.mimeType}\n   link: ${f.webViewLink}`).join("\n\n");
+      return { content: [{ type: "text", text: `🔍 ${files.length} risultati:\n\n${text}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Drive search error: ${err.message}` }], isError: true };
+    }
+  });
+
+  // ----- GOOGLE SHEETS -----
+  server.registerTool("sheets_read_range", {
+    title: "Sheets - Leggi Range",
+    description: "Legge un range di celle da un Google Sheet. Range in notazione A1 (es. 'Foglio1!A1:D10' o 'A1:Z100').",
+    inputSchema: {
+      spreadsheet_id: z.string().describe("ID dello spreadsheet (dall'URL del Sheet)"),
+      range: z.string().describe("Range A1 (es. 'Foglio1!A1:D10')"),
+    },
+  }, async ({ spreadsheet_id, range }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const sheets = google.sheets({ version: "v4", auth });
+      const resp = await sheets.spreadsheets.values.get({ spreadsheetId: spreadsheet_id, range });
+      const values = resp.data.values || [];
+      if (values.length === 0) return { content: [{ type: "text", text: `Nessun dato nel range ${range}` }] };
+      const text = values.map((row, i) => `Riga ${i + 1}: ${JSON.stringify(row)}`).join("\n");
+      return { content: [{ type: "text", text: `📊 ${values.length} righe lette da ${range}:\n\n${text}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Sheets read error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("sheets_write_range", {
+    title: "Sheets - Scrivi Range",
+    description: "Scrive valori in un range specifico di un Google Sheet. Sovrascrive i valori esistenti nel range. Usa sheets_append_row per aggiungere righe in fondo.",
+    inputSchema: {
+      spreadsheet_id: z.string().describe("ID dello spreadsheet"),
+      range: z.string().describe("Range A1 dove scrivere (es. 'Foglio1!A1:C3')"),
+      values: z.array(z.array(z.any())).describe("Array 2D di valori. Ogni sotto-array è una riga. Es: [['Nome','Età'],['Paolo',38]]"),
+    },
+  }, async ({ spreadsheet_id, range, values }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const sheets = google.sheets({ version: "v4", auth });
+      const resp = await sheets.spreadsheets.values.update({
+        spreadsheetId: spreadsheet_id,
+        range,
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values },
+      });
+      return { content: [{ type: "text", text: `✅ Scritte ${resp.data.updatedCells} celle in ${resp.data.updatedRange}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Sheets write error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("sheets_append_row", {
+    title: "Sheets - Aggiungi Riga",
+    description: "Appende una o più righe in fondo a un Google Sheet. Ideale per log, tracking clienti, CRM, registro attività.",
+    inputSchema: {
+      spreadsheet_id: z.string().describe("ID dello spreadsheet"),
+      range: z.string().describe("Range che identifica la tabella (es. 'Foglio1!A:Z')"),
+      values: z.array(z.array(z.any())).describe("Array 2D di righe da aggiungere. Es: [['2026-04-10','Cliente X','Pagamento']]"),
+    },
+  }, async ({ spreadsheet_id, range, values }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const sheets = google.sheets({ version: "v4", auth });
+      const resp = await sheets.spreadsheets.values.append({
+        spreadsheetId: spreadsheet_id,
+        range,
+        valueInputOption: "USER_ENTERED",
+        insertDataOption: "INSERT_ROWS",
+        requestBody: { values },
+      });
+      return { content: [{ type: "text", text: `✅ Righe appese: ${values.length}\nRange aggiornato: ${resp.data.updates?.updatedRange}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Sheets append error: ${err.message}` }], isError: true };
+    }
+  });
+
+  // ----- GOOGLE DOCS -----
+  server.registerTool("docs_read", {
+    title: "Docs - Leggi Documento",
+    description: "Legge il contenuto testuale di un Google Doc. Restituisce tutto il testo del documento in sequenza. Per export in PDF usa drive_export_google_file.",
+    inputSchema: {
+      document_id: z.string().describe("ID del Google Doc (dall'URL)"),
+    },
+  }, async ({ document_id }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const docs = google.docs({ version: "v1", auth });
+      const doc = await docs.documents.get({ documentId: document_id });
+      const content = doc.data.body?.content || [];
+      const text = content.map(block => {
+        if (block.paragraph) {
+          return (block.paragraph.elements || []).map(e => e.textRun?.content || "").join("");
+        }
+        return "";
+      }).join("");
+      return { content: [{ type: "text", text: `📄 ${doc.data.title}\n\n${text}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Docs read error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("docs_append_text", {
+    title: "Docs - Aggiungi Testo",
+    description: "Appende testo in fondo a un Google Doc esistente. Utile per log, note progressive, diari, registri.",
+    inputSchema: {
+      document_id: z.string().describe("ID del Google Doc"),
+      text: z.string().describe("Testo da appendere"),
+    },
+  }, async ({ document_id, text }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const docs = google.docs({ version: "v1", auth });
+      const doc = await docs.documents.get({ documentId: document_id });
+      const endIndex = doc.data.body?.content?.slice(-1)[0]?.endIndex || 1;
+      await docs.documents.batchUpdate({
+        documentId: document_id,
+        requestBody: {
+          requests: [{
+            insertText: {
+              location: { index: endIndex - 1 },
+              text: `\n${text}`,
+            },
+          }],
+        },
+      });
+      return { content: [{ type: "text", text: `✅ Testo appeso al documento "${doc.data.title}"` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Docs append error: ${err.message}` }], isError: true };
+    }
   });
 
   // ===== AVVIA SERVER MCP =====
