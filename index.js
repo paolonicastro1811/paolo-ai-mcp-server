@@ -114,15 +114,131 @@ function base64urlToBuffer(base64url) {
 }
 
 // ============================================================
+// OPENAI AUDIO — Helper condivisi
+// ============================================================
+// Helper usati dai tool openai_text_to_speech e openai_generate_podcast.
+// Niente SDK OpenAI: usiamo fetch nativo come per gli altri tool del server.
+// ============================================================
+
+/**
+ * Catalogo delle voci OpenAI TTS con descrizioni in italiano e use case.
+ * Usato da openai_list_voices.
+ */
+const OPENAI_VOICES_CATALOG = {
+  marin:   { description: "Top quality, equilibrata e naturale.",                                  best_for: "podcast professionali, audiolibri" },
+  cedar:   { description: "Top quality, calda e autorevole.",                                      best_for: "corsi, lezioni, contenuti formativi" },
+  alloy:   { description: "Neutra e versatile, buona per qualsiasi contenuto generale.",           best_for: "generico, demo, prototipi" },
+  ash:     { description: "Maschile, sicura e professionale.",                                     best_for: "business, presentazioni" },
+  ballad:  { description: "Espressiva ed emotiva, perfetta per storytelling.",                     best_for: "storytelling, narrativa" },
+  coral:   { description: "Calda e accogliente, ottima per italiano conversazionale.",             best_for: "conversazione informale, tutorial italiani" },
+  echo:    { description: "Maschile profonda, autorevole e leggermente formale.",                  best_for: "documentari, news" },
+  fable:   { description: "Calda e narrativa, perfetta per storie e fiabe.",                       best_for: "storytelling, fiabe, audiolibri" },
+  nova:    { description: "Energica e coinvolgente, dinamica. Buona per italiano vivace.",         best_for: "marketing, contenuti social, podcast energici" },
+  onyx:    { description: "Maschile profonda e autorevole, educational e seria.",                  best_for: "educational, documentari seri" },
+  sage:    { description: "Calma e riflessiva, perfetta per meditazione o consigli.",              best_for: "meditazione, mindfulness, advice" },
+  shimmer: { description: "Femminile dolce e gentile, ottima per italiano rilassante.",            best_for: "wellness, relax, contenuti calmi" },
+  verse:   { description: "Versatile ed espressiva, supporta una vasta gamma di toni.",            best_for: "multi-purpose, adattabile a vari contesti" },
+};
+
+const OPENAI_VOICES_LIST = Object.keys(OPENAI_VOICES_CATALOG);
+
+/**
+ * Spezza un testo lungo in chunk rispettando i confini naturali del testo.
+ * Strategia: prova prima a tagliare a fine paragrafo, poi a fine frase,
+ * infine — solo se proprio necessario — a fine parola.
+ *
+ * @param {string} text - Il testo da spezzare
+ * @param {number} maxChars - Limite massimo caratteri per chunk
+ * @returns {string[]} Array di chunk
+ */
+function splitTextIntoChunks(text, maxChars) {
+  const cleaned = text.trim();
+  if (cleaned.length <= maxChars) return [cleaned];
+
+  const chunks = [];
+  let remaining = cleaned;
+
+  while (remaining.length > maxChars) {
+    let cutAt = -1;
+
+    // 1) Prova a tagliare a fine paragrafo nei primi maxChars caratteri
+    const paraEnd = remaining.lastIndexOf("\n\n", maxChars);
+    if (paraEnd > maxChars * 0.5) {
+      cutAt = paraEnd + 2;
+    }
+
+    // 2) Altrimenti prova a fine frase
+    if (cutAt === -1) {
+      const sentenceEnders = [". ", "! ", "? ", ".\n", "!\n", "?\n"];
+      let bestEnd = -1;
+      for (const ender of sentenceEnders) {
+        const idx = remaining.lastIndexOf(ender, maxChars);
+        if (idx > bestEnd) bestEnd = idx;
+      }
+      if (bestEnd > maxChars * 0.5) {
+        cutAt = bestEnd + 2;
+      }
+    }
+
+    // 3) Fallback: taglia a fine parola
+    if (cutAt === -1) {
+      const wordEnd = remaining.lastIndexOf(" ", maxChars);
+      cutAt = wordEnd > 0 ? wordEnd + 1 : maxChars;
+    }
+
+    chunks.push(remaining.slice(0, cutAt).trim());
+    remaining = remaining.slice(cutAt).trim();
+  }
+
+  if (remaining.length > 0) chunks.push(remaining);
+  return chunks;
+}
+
+/**
+ * Chiama OpenAI TTS API per un singolo chunk di testo e ritorna il Buffer MP3.
+ * Usa fetch nativo (no SDK). Il parametro 'instructions' viene incluso solo
+ * se il modello è gpt-4o-mini-tts (gli altri lo ignorerebbero).
+ */
+async function openaiTTSChunk({ text, voice, model, speed, instructions }) {
+  const payload = {
+    model,
+    voice,
+    input: text,
+    speed,
+    response_format: "mp3",
+  };
+  if (model === "gpt-4o-mini-tts" && instructions) {
+    payload.instructions = instructions;
+  }
+
+  const r = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${KEYS.openai}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!r.ok) {
+    const errText = await r.text();
+    throw new Error(`OpenAI TTS error (${r.status}): ${errText}`);
+  }
+
+  const arrayBuffer = await r.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+// ============================================================
 // ROUTES
 // ============================================================
 
 app.get("/", (_req, res) => {
-  res.json({ status: "ok", server: "Paolo AI MCP Server", version: "2.2.0" });
+  res.json({ status: "ok", server: "Paolo AI MCP Server", version: "2.3.0" });
 });
 
 app.post("/mcp", async (req, res) => {
-  const server = new McpServer({ name: "paolo-ai-mcp-server", version: "2.2.0" });
+  const server = new McpServer({ name: "paolo-ai-mcp-server", version: "2.3.0" });
 
   // ===== ELEVENLABS =====
   server.registerTool("elevenlabs_list_voices", {
@@ -211,6 +327,157 @@ app.post("/mcp", async (req, res) => {
     if (!r.ok) throw new Error(`DALL-E error: ${await r.text()}`);
     const d = await r.json();
     return { content: [{ type: "text", text: `\u1f3a8 Immagine generata!\nURL: ${d.data[0].url}` }] };
+  });
+
+  // ===== OPENAI AUDIO (TTS + Podcast) =====
+
+  server.registerTool("openai_list_voices", {
+    title: "OpenAI - Lista Voci TTS",
+    description: "Elenca tutte le voci OpenAI TTS disponibili (13 totali) con descrizioni in italiano e suggerimenti d'uso. USA QUESTO TOOL prima di generare audio o podcast quando l'utente non ha specificato una voce, o quando chiede consigli su quale voce scegliere per un contenuto. Restituisce nome voce, descrizione e use case ideale.",
+    inputSchema: {},
+  }, async () => {
+    const list = Object.entries(OPENAI_VOICES_CATALOG).map(([name, info]) =>
+      `🎙️ ${name.padEnd(8)} — ${info.description}\n           Ideale per: ${info.best_for}`
+    ).join("\n\n");
+    const note = `\n\nNote importanti:\n• marin e cedar sono le voci top-quality di OpenAI (raccomandate per podcast professionali, disponibili solo con modello gpt-4o-mini-tts)\n• Per italiano conversazionale: nova, coral, shimmer\n• Per italiano professionale/educational: cedar, onyx, ash\n• Tutte le voci supportano italiano ma sono primariamente ottimizzate per inglese\n• Per qualità top in italiano resta superiore ElevenLabs (usa elevenlabs_text_to_speech)`;
+    return { content: [{ type: "text", text: `Voci OpenAI TTS disponibili (${OPENAI_VOICES_LIST.length} totali):\n\n${list}${note}` }] };
+  });
+
+  server.registerTool("openai_text_to_speech", {
+    title: "OpenAI - Text to Speech",
+    description: "Converte testo in audio MP3 usando OpenAI TTS. Carica il file su Vercel Blob (cleanup automatico dopo 24h) e restituisce un URL pubblico. USA QUESTO TOOL quando: (1) l'utente vuole un audio breve singolo (max 4096 caratteri per tts-1/tts-1-hd, max ~7500 per gpt-4o-mini-tts), (2) preferisce esplicitamente OpenAI invece di ElevenLabs, (3) il volume di testo è alto e il costo conta (OpenAI ~10x più economico di ElevenLabs), (4) vuole controllare tono ed emozione con il parametro 'instructions' (solo gpt-4o-mini-tts). NON usare per podcast lunghi (>4000 caratteri): usa openai_generate_podcast invece. Per qualità top voce italiana resta meglio elevenlabs_text_to_speech.",
+    inputSchema: {
+      text: z.string().describe("Testo da convertire in audio. Max 4096 caratteri per tts-1/tts-1-hd, max ~7500 per gpt-4o-mini-tts."),
+      voice: z.enum(OPENAI_VOICES_LIST).default("nova").describe("Voce OpenAI. Default: nova (energica, ottima per italiano). Usa openai_list_voices per consigli."),
+      model: z.enum(["tts-1", "tts-1-hd", "gpt-4o-mini-tts"]).default("gpt-4o-mini-tts").describe("Modello TTS. tts-1 economico, tts-1-hd qualità superiore, gpt-4o-mini-tts il più recente con supporto a 'instructions' per controllare tono."),
+      speed: z.number().min(0.25).max(4.0).default(1.0).describe("Velocità lettura. 0.25 lentissimo, 1.0 normale, 4.0 velocissimo."),
+      instructions: z.string().optional().describe("SOLO per gpt-4o-mini-tts: istruzioni in linguaggio naturale per tono/emozione/pacing. Esempi: 'Parla con tono caldo e rilassato', 'Suona entusiasta come un presentatore radio'. Ignorato per tts-1 e tts-1-hd."),
+    },
+  }, async ({ text, voice, model, speed, instructions }) => {
+    // Validazione limite caratteri specifico per modello
+    if ((model === "tts-1" || model === "tts-1-hd") && text.length > 4096) {
+      return {
+        content: [{ type: "text", text: `❌ Errore: il modello ${model} ha un limite massimo di 4096 caratteri per richiesta. Il testo fornito ha ${text.length} caratteri.\n\nSoluzioni:\n• Usa il modello gpt-4o-mini-tts (limite ~7500 caratteri)\n• Usa openai_generate_podcast che spezza automaticamente i testi lunghi` }],
+        isError: true,
+      };
+    }
+    if (model === "gpt-4o-mini-tts" && text.length > 7500) {
+      return {
+        content: [{ type: "text", text: `❌ Errore: il modello gpt-4o-mini-tts ha un limite di ~7500 caratteri. Il testo fornito ha ${text.length} caratteri.\n\nUsa openai_generate_podcast che spezza automaticamente i testi lunghi.` }],
+        isError: true,
+      };
+    }
+
+    try {
+      const t0 = Date.now();
+      const buffer = await openaiTTSChunk({ text, voice, model, speed, instructions });
+      const filename = `openai_${voice}_${model}.mp3`;
+      const url = await uploadBufferToBlob(buffer, filename, "tts-podcasts");
+      const durationMs = Date.now() - t0;
+      const sizeKB = Math.round(buffer.length / 1024);
+
+      return {
+        content: [{
+          type: "text",
+          text: `✅ Audio TTS generato\n\n🔗 URL: ${url}\n\n📊 Dettagli:\n• Voce: ${voice}\n• Modello: ${model}\n• Velocità: ${speed}x${instructions ? `\n• Istruzioni tono: ${instructions}` : ""}\n• Caratteri: ${text.length}\n• Dimensione: ${sizeKB} KB\n• Tempo generazione: ${(durationMs / 1000).toFixed(1)}s\n\n⚠️ Policy OpenAI: se condividi questo audio con altri utenti, dichiara sempre che la voce è AI-generated.`
+        }]
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `❌ OpenAI TTS error: ${err.message}\n\nPossibili cause:\n• OPENAI_API_KEY non valida o mancante su Vercel\n• Quota OpenAI esaurita (verifica platform.openai.com/usage)\n• Modello non disponibile sul tuo account\n• Problema di rete temporaneo` }],
+        isError: true,
+      };
+    }
+  });
+
+  server.registerTool("openai_generate_podcast", {
+    title: "OpenAI - Genera Podcast",
+    description: "Genera un podcast completo da uno script lungo (anche 50.000+ caratteri). Pipeline automatica: (1) split intelligente in chunk rispettando confini di paragrafo e frase, (2) generazione audio in PARALLELO per tutti i chunk con OpenAI TTS, (3) concatenazione dei MP3 in singolo file, (4) upload su Vercel Blob, (5) URL pubblico singolo. USA QUESTO TOOL quando l'utente vuole generare podcast/audiolibri/episodi da script lunghi, quando il testo supera i 4000 caratteri, o quando parla esplicitamente di 'podcast', 'episodio', 'audio lungo', 'narrazione completa'. Costo indicativo: episodio 10 minuti (~9000 caratteri) con gpt-4o-mini-tts circa $0.10-0.15. Tempo: 15-40 secondi tipici. ATTENZIONE timeout Vercel: Hobby plan 10s, Pro plan 60s — per script molto lunghi (>20.000 caratteri) potrebbe servire spezzare in più episodi.",
+    inputSchema: {
+      script: z.string().describe("Script completo del podcast in italiano (o altra lingua). Può contenere paragrafi multipli, viene spezzato automaticamente. Min 100, max 100.000 caratteri."),
+      voice: z.enum(OPENAI_VOICES_LIST).default("nova").describe("Voce per la narrazione. Default nova. Per podcast professionali considera marin o cedar (top quality, solo gpt-4o-mini-tts)."),
+      model: z.enum(["tts-1", "tts-1-hd", "gpt-4o-mini-tts"]).default("gpt-4o-mini-tts").describe("Modello TTS. Per podcast pubblicabili usa gpt-4o-mini-tts o tts-1-hd. Per draft veloci ed economici usa tts-1."),
+      speed: z.number().min(0.25).max(4.0).default(1.0).describe("Velocità narrazione. Per podcast italiani consiglio 1.0 (normale) o 0.95 (leggermente più lento per chiarezza)."),
+      instructions: z.string().optional().describe("SOLO per gpt-4o-mini-tts: istruzioni di tono per tutto il podcast. Esempi: 'Tono conversazionale come un host di podcast esperto', 'Lettura calma da audiolibro'. Applicato a tutti i chunk per consistenza."),
+      episode_title: z.string().optional().describe("Titolo opzionale dell'episodio, usato nel filename del MP3 finale (es. 'PDF1_capitolo8_allucinazioni')."),
+    },
+  }, async ({ script, voice, model, speed, instructions, episode_title }) => {
+    if (script.length < 100) {
+      return {
+        content: [{ type: "text", text: `❌ Errore: lo script deve avere almeno 100 caratteri. Lunghezza fornita: ${script.length}.\n\nPer testi brevi usa openai_text_to_speech.` }],
+        isError: true,
+      };
+    }
+    if (script.length > 100000) {
+      return {
+        content: [{ type: "text", text: `❌ Errore: lo script supera il limite di 100.000 caratteri (lunghezza: ${script.length}).\n\nSpezza in più episodi e generali separatamente.` }],
+        isError: true,
+      };
+    }
+
+    const t0 = Date.now();
+
+    try {
+      // Determina dimensione max per chunk in base al modello
+      const maxCharsPerChunk = model === "gpt-4o-mini-tts" ? 7000 : 3800;
+
+      // Spezza lo script in chunk intelligenti
+      const chunks = splitTextIntoChunks(script, maxCharsPerChunk);
+
+      // Genera audio per tutti i chunk in PARALLELO
+      const audioBuffers = await Promise.all(
+        chunks.map(chunk =>
+          openaiTTSChunk({ text: chunk, voice, model, speed, instructions })
+        )
+      );
+
+      // Concatena i Buffer MP3 in un unico file
+      // Funziona perché OpenAI produce MP3 con stesso encoding,
+      // e i frame MP3 sono autonomi (i player ignorano gli ID3 intermedi).
+      const fullAudioBuffer = Buffer.concat(audioBuffers);
+
+      // Genera filename descrittivo
+      const safeTitle = (episode_title || "podcast")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_|_$/g, "")
+        .slice(0, 50);
+      const filename = `${safeTitle}_${voice}.mp3`;
+
+      // Upload su Vercel Blob (folder tts-podcasts/)
+      const url = await uploadBufferToBlob(fullAudioBuffer, filename, "tts-podcasts");
+
+      const durationMs = Date.now() - t0;
+      const sizeMB = (fullAudioBuffer.length / (1024 * 1024)).toFixed(2);
+      // Stima durata audio: ~150 parole/min in italiano = ~900 caratteri/min
+      const estimatedMinutes = (script.length / 900).toFixed(1);
+
+      return {
+        content: [{
+          type: "text",
+          text: `🎙️ Podcast generato!\n\n🔗 URL: ${url}\n\n📊 Dettagli:\n• Titolo: ${episode_title || "(senza titolo)"}\n• Voce: ${voice}\n• Modello: ${model}\n• Velocità: ${speed}x${instructions ? `\n• Tono: ${instructions}` : ""}\n• Caratteri script: ${script.length.toLocaleString("it-IT")}\n• Chunk generati: ${chunks.length} (in parallelo)\n• Dimensione MP3: ${sizeMB} MB\n• Durata audio stimata: ~${estimatedMinutes} minuti\n• Tempo generazione: ${(durationMs / 1000).toFixed(1)}s\n\n⚠️ Policy OpenAI: quando condividi questo podcast, dichiara agli ascoltatori che la voce è AI-generated.\n\n💡 Il file resterà su Vercel Blob fino al prossimo cleanup automatico (entro 24h). Scaricalo dal link sopra se vuoi conservarlo.`
+        }]
+      };
+
+    } catch (err) {
+      // Diagnosi automatica del tipo di errore
+      let diagnosis = "Errore non identificato. Controlla i log Vercel per dettagli.";
+      const msg = err.message || "";
+      if (msg.includes("timeout") || msg.includes("TIMEOUT") || msg.includes("FUNCTION_INVOCATION_TIMEOUT")) {
+        diagnosis = "Timeout Vercel (Hobby: 10s, Pro: 60s). Soluzione: spezza lo script in più episodi più corti, o passa al Pro plan.";
+      } else if (msg.includes("rate") || msg.includes("429")) {
+        diagnosis = "Rate limit OpenAI raggiunto. Aspetta un minuto e riprova.";
+      } else if (msg.includes("quota") || msg.includes("insufficient")) {
+        diagnosis = "Quota OpenAI esaurita. Verifica platform.openai.com/usage.";
+      } else if (msg.includes("401")) {
+        diagnosis = "OPENAI_API_KEY non valida. Verifica le env var su Vercel.";
+      }
+
+      return {
+        content: [{ type: "text", text: `❌ Errore generazione podcast: ${msg}\n\n🔍 Diagnosi: ${diagnosis}\n\nCose da provare:\n• Verifica OPENAI_API_KEY su Vercel\n• Per script lunghi usa modello gpt-4o-mini-tts (chunk più grandi)\n• Riduci la lunghezza dello script o spezzalo in più episodi\n• Controlla i log della function su Vercel dashboard` }],
+        isError: true,
+      };
+    }
   });
 
   // ===== HEYGEN (aggiornato a V2) =====
@@ -975,12 +1242,12 @@ app.get("/mcp", (_req, res) => {
 //     non possono passare header custom, solo query string)
 //
 // Elimina tutti i blob più vecchi di max_age_hours (default 24)
-// nelle cartelle gmail-attachments/, drive-files/, drive-exports/.
+// nelle cartelle gmail-attachments/, drive-files/, drive-exports/, tts-podcasts/.
 // ============================================================
 
 async function runCleanup(maxAgeHours) {
   const cutoffMs = Date.now() - maxAgeHours * 3600 * 1000;
-  const prefixes = ["gmail-attachments/", "drive-files/", "drive-exports/"];
+  const prefixes = ["gmail-attachments/", "drive-files/", "drive-exports/", "tts-podcasts/"];
 
   const summary = {
     started_at: new Date().toISOString(),
