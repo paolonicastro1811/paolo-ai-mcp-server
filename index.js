@@ -113,6 +113,50 @@ function base64urlToBuffer(base64url) {
   return Buffer.from(base64, "base64");
 }
 
+/**
+ * Carica un Buffer su Google Drive in una cartella specifica.
+ * Usa la stessa autenticazione OAuth dei tool Drive esistenti.
+ *
+ * @param {Buffer} buffer - Il contenuto del file da caricare
+ * @param {string} filename - Nome del file su Drive
+ * @param {string} folderId - ID della cartella Drive di destinazione
+ * @param {string} mimeType - MIME type del file (es. "audio/mpeg" per MP3)
+ * @returns {Promise<{fileId: string, webViewLink: string, webContentLink: string}>}
+ */
+async function uploadBufferToDrive(buffer, filename, folderId, mimeType) {
+  const google = await loadGoogleapis();
+  const auth = await getGoogleAuth();
+  const drive = google.drive({ version: "v3", auth });
+
+  // Sanitizza il filename per Drive (Drive accetta più caratteri di Blob, ma evitiamo /)
+  const safeFilename = filename.replace(/[/\\]/g, "_");
+
+  // Crea il file su Drive con metadata + content multipart
+  // Usiamo Readable.from() per convertire il Buffer in stream per googleapis
+  const { Readable } = await import("stream");
+
+  const resp = await drive.files.create({
+    requestBody: {
+      name: safeFilename,
+      parents: folderId ? [folderId] : undefined,
+      mimeType,
+    },
+    media: {
+      mimeType,
+      body: Readable.from(buffer),
+    },
+    fields: "id,name,webViewLink,webContentLink,size",
+  });
+
+  return {
+    fileId: resp.data.id,
+    name: resp.data.name,
+    webViewLink: resp.data.webViewLink,
+    webContentLink: resp.data.webContentLink,
+    size: resp.data.size,
+  };
+}
+
 // ============================================================
 // OPENAI AUDIO — Helper condivisi
 // ============================================================
@@ -234,11 +278,11 @@ async function openaiTTSChunk({ text, voice, model, speed, instructions }) {
 // ============================================================
 
 app.get("/", (_req, res) => {
-  res.json({ status: "ok", server: "Paolo AI MCP Server", version: "2.3.0" });
+  res.json({ status: "ok", server: "Paolo AI MCP Server", version: "2.4.0" });
 });
 
 app.post("/mcp", async (req, res) => {
-  const server = new McpServer({ name: "paolo-ai-mcp-server", version: "2.3.0" });
+  const server = new McpServer({ name: "paolo-ai-mcp-server", version: "2.4.0" });
 
   // ===== ELEVENLABS =====
   server.registerTool("elevenlabs_list_voices", {
@@ -392,7 +436,7 @@ app.post("/mcp", async (req, res) => {
 
   server.registerTool("openai_generate_podcast", {
     title: "OpenAI - Genera Podcast",
-    description: "Genera un podcast completo da uno script lungo (anche 50.000+ caratteri). Pipeline automatica: (1) split intelligente in chunk rispettando confini di paragrafo e frase, (2) generazione audio in PARALLELO per tutti i chunk con OpenAI TTS, (3) concatenazione dei MP3 in singolo file, (4) upload su Vercel Blob, (5) URL pubblico singolo. USA QUESTO TOOL quando l'utente vuole generare podcast/audiolibri/episodi da script lunghi, quando il testo supera i 4000 caratteri, o quando parla esplicitamente di 'podcast', 'episodio', 'audio lungo', 'narrazione completa'. Costo indicativo: episodio 10 minuti (~9000 caratteri) con gpt-4o-mini-tts circa $0.10-0.15. Tempo: 15-40 secondi tipici. ATTENZIONE timeout Vercel: Hobby plan 10s, Pro plan 60s — per script molto lunghi (>20.000 caratteri) potrebbe servire spezzare in più episodi.",
+    description: "Genera un podcast completo da uno script lungo (anche 50.000+ caratteri). Pipeline automatica: (1) split intelligente in chunk rispettando confini di paragrafo e frase, (2) generazione audio in PARALLELO per tutti i chunk con OpenAI TTS, (3) concatenazione dei MP3 in singolo file, (4) upload su Vercel Blob, (5) URL pubblico singolo. OPZIONALE: con upload_to_drive=true salva una copia permanente nella cartella Google Drive configurata in DRIVE_PODCAST_FOLDER_ID (o in una cartella custom se passi drive_folder_id). USA QUESTO TOOL quando l'utente vuole generare podcast/audiolibri/episodi da script lunghi, quando il testo supera i 4000 caratteri, o quando parla esplicitamente di 'podcast', 'episodio', 'audio lungo', 'narrazione completa'. Quando l'utente dice 'mandalo su Drive' o 'salvalo permanentemente' o 'voglio conservarlo', attiva upload_to_drive=true. Costo indicativo: episodio 10 minuti (~9000 caratteri) con gpt-4o-mini-tts circa $0.10-0.15. Tempo: 15-40 secondi tipici (più 3-5s extra se upload_to_drive=true). ATTENZIONE timeout Vercel: Hobby plan 10s, Pro plan 60s.",
     inputSchema: {
       script: z.string().describe("Script completo del podcast in italiano (o altra lingua). Può contenere paragrafi multipli, viene spezzato automaticamente. Min 100, max 100.000 caratteri."),
       voice: z.enum(OPENAI_VOICES_LIST).default("nova").describe("Voce per la narrazione. Default nova. Per podcast professionali considera marin o cedar (top quality, solo gpt-4o-mini-tts)."),
@@ -400,8 +444,10 @@ app.post("/mcp", async (req, res) => {
       speed: z.number().min(0.25).max(4.0).default(1.0).describe("Velocità narrazione. Per podcast italiani consiglio 1.0 (normale) o 0.95 (leggermente più lento per chiarezza)."),
       instructions: z.string().optional().describe("SOLO per gpt-4o-mini-tts: istruzioni di tono per tutto il podcast. Esempi: 'Tono conversazionale come un host di podcast esperto', 'Lettura calma da audiolibro'. Applicato a tutti i chunk per consistenza."),
       episode_title: z.string().optional().describe("Titolo opzionale dell'episodio, usato nel filename del MP3 finale (es. 'PDF1_capitolo8_allucinazioni')."),
+      upload_to_drive: z.boolean().default(false).describe("Se true, dopo l'upload su Vercel Blob carica una copia PERMANENTE su Google Drive nella cartella configurata in DRIVE_PODCAST_FOLDER_ID. Usa true quando l'utente vuole conservare il podcast (es. 'mandalo su Drive', 'salvalo permanentemente', 'voglio ascoltarlo dal telefono'). Default false."),
+      drive_folder_id: z.string().optional().describe("ID della cartella Google Drive dove caricare il podcast. Se omesso, usa DRIVE_PODCAST_FOLDER_ID (env var). Specifica solo se vuoi una cartella diversa dal default. Ignorato se upload_to_drive=false."),
     },
-  }, async ({ script, voice, model, speed, instructions, episode_title }) => {
+  }, async ({ script, voice, model, speed, instructions, episode_title, upload_to_drive, drive_folder_id }) => {
     if (script.length < 100) {
       return {
         content: [{ type: "text", text: `❌ Errore: lo script deve avere almeno 100 caratteri. Lunghezza fornita: ${script.length}.\n\nPer testi brevi usa openai_text_to_speech.` }],
@@ -444,19 +490,62 @@ app.post("/mcp", async (req, res) => {
         .slice(0, 50);
       const filename = `${safeTitle}_${voice}.mp3`;
 
-      // Upload su Vercel Blob (folder tts-podcasts/)
-      const url = await uploadBufferToBlob(fullAudioBuffer, filename, "tts-podcasts");
+      // Upload su Vercel Blob (folder tts-podcasts/) — sempre eseguito
+      const blobUrl = await uploadBufferToBlob(fullAudioBuffer, filename, "tts-podcasts");
+      const tBlobDone = Date.now();
+
+      // Upload su Google Drive — solo se richiesto
+      let driveResult = null;
+      let driveError = null;
+      if (upload_to_drive) {
+        const targetFolderId = drive_folder_id || process.env.DRIVE_PODCAST_FOLDER_ID;
+        if (!targetFolderId) {
+          driveError = "DRIVE_PODCAST_FOLDER_ID non configurato sulle env var Vercel e nessun drive_folder_id passato come parametro. Il file è comunque su Vercel Blob (link sopra).";
+        } else {
+          try {
+            // Filename Drive: includiamo timestamp ISO leggibile per ordinamento
+            const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+            const driveFilename = `${timestamp}_${filename}`;
+            driveResult = await uploadBufferToDrive(fullAudioBuffer, driveFilename, targetFolderId, "audio/mpeg");
+          } catch (driveErr) {
+            driveError = `Upload Drive fallito: ${driveErr.message}. Il file è comunque disponibile su Vercel Blob (link sopra).`;
+          }
+        }
+      }
 
       const durationMs = Date.now() - t0;
+      const blobMs = tBlobDone - t0;
+      const driveMs = upload_to_drive && driveResult ? Date.now() - tBlobDone : 0;
       const sizeMB = (fullAudioBuffer.length / (1024 * 1024)).toFixed(2);
       // Stima durata audio: ~150 parole/min in italiano = ~900 caratteri/min
       const estimatedMinutes = (script.length / 900).toFixed(1);
 
+      // Costruisci output multi-sezione
+      let outputText = `🎙️ Podcast generato!\n\n`;
+      outputText += `🔗 URL temporaneo (Vercel Blob, cleanup 24h):\n${blobUrl}\n\n`;
+
+      if (upload_to_drive) {
+        if (driveResult) {
+          outputText += `✅ COPIA PERMANENTE su Google Drive:\n📁 ${driveResult.name}\n🔗 ${driveResult.webViewLink}\n📂 File ID: ${driveResult.fileId}\n\n`;
+        } else if (driveError) {
+          outputText += `⚠️ Upload Drive non riuscito:\n${driveError}\n\n`;
+        }
+      }
+
+      outputText += `📊 Dettagli:\n• Titolo: ${episode_title || "(senza titolo)"}\n• Voce: ${voice}\n• Modello: ${model}\n• Velocità: ${speed}x`;
+      if (instructions) outputText += `\n• Tono: ${instructions}`;
+      outputText += `\n• Caratteri script: ${script.length.toLocaleString("it-IT")}\n• Chunk generati: ${chunks.length} (in parallelo)\n• Dimensione MP3: ${sizeMB} MB\n• Durata audio stimata: ~${estimatedMinutes} minuti\n• Tempo generazione TTS+Blob: ${(blobMs / 1000).toFixed(1)}s`;
+      if (driveMs > 0) outputText += `\n• Tempo upload Drive: ${(driveMs / 1000).toFixed(1)}s`;
+      outputText += `\n• Tempo totale: ${(durationMs / 1000).toFixed(1)}s\n\n`;
+
+      outputText += `⚠️ Policy OpenAI: quando condividi questo podcast, dichiara agli ascoltatori che la voce è AI-generated.`;
+
+      if (!upload_to_drive) {
+        outputText += `\n\n💡 Vuoi conservarlo? Aggiungi upload_to_drive=true al prossimo episodio per salvarlo automaticamente sul tuo Google Drive (cartella "Aduio e Podcast"). Altrimenti scaricalo dal link sopra entro 24h.`;
+      }
+
       return {
-        content: [{
-          type: "text",
-          text: `🎙️ Podcast generato!\n\n🔗 URL: ${url}\n\n📊 Dettagli:\n• Titolo: ${episode_title || "(senza titolo)"}\n• Voce: ${voice}\n• Modello: ${model}\n• Velocità: ${speed}x${instructions ? `\n• Tono: ${instructions}` : ""}\n• Caratteri script: ${script.length.toLocaleString("it-IT")}\n• Chunk generati: ${chunks.length} (in parallelo)\n• Dimensione MP3: ${sizeMB} MB\n• Durata audio stimata: ~${estimatedMinutes} minuti\n• Tempo generazione: ${(durationMs / 1000).toFixed(1)}s\n\n⚠️ Policy OpenAI: quando condividi questo podcast, dichiara agli ascoltatori che la voce è AI-generated.\n\n💡 Il file resterà su Vercel Blob fino al prossimo cleanup automatico (entro 24h). Scaricalo dal link sopra se vuoi conservarlo.`
-        }]
+        content: [{ type: "text", text: outputText }]
       };
 
     } catch (err) {
@@ -464,17 +553,19 @@ app.post("/mcp", async (req, res) => {
       let diagnosis = "Errore non identificato. Controlla i log Vercel per dettagli.";
       const msg = err.message || "";
       if (msg.includes("timeout") || msg.includes("TIMEOUT") || msg.includes("FUNCTION_INVOCATION_TIMEOUT")) {
-        diagnosis = "Timeout Vercel (Hobby: 10s, Pro: 60s). Soluzione: spezza lo script in più episodi più corti, o passa al Pro plan.";
+        diagnosis = "Timeout Vercel (Hobby: 10s, Pro: 60s, Pro+maxDuration: 300s). Soluzione: spezza lo script in più episodi più corti.";
       } else if (msg.includes("rate") || msg.includes("429")) {
         diagnosis = "Rate limit OpenAI raggiunto. Aspetta un minuto e riprova.";
       } else if (msg.includes("quota") || msg.includes("insufficient")) {
         diagnosis = "Quota OpenAI esaurita. Verifica platform.openai.com/usage.";
       } else if (msg.includes("401")) {
         diagnosis = "OPENAI_API_KEY non valida. Verifica le env var su Vercel.";
+      } else if (msg.includes("invalid_grant") || msg.includes("unauthorized_client")) {
+        diagnosis = "Google OAuth scaduto o non valido. Verifica GOOGLE_REFRESH_TOKEN su Vercel o testa con google_test_auth.";
       }
 
       return {
-        content: [{ type: "text", text: `❌ Errore generazione podcast: ${msg}\n\n🔍 Diagnosi: ${diagnosis}\n\nCose da provare:\n• Verifica OPENAI_API_KEY su Vercel\n• Per script lunghi usa modello gpt-4o-mini-tts (chunk più grandi)\n• Riduci la lunghezza dello script o spezzalo in più episodi\n• Controlla i log della function su Vercel dashboard` }],
+        content: [{ type: "text", text: `❌ Errore generazione podcast: ${msg}\n\n🔍 Diagnosi: ${diagnosis}\n\nCose da provare:\n• Verifica OPENAI_API_KEY su Vercel\n• Per script lunghi usa modello gpt-4o-mini-tts (chunk più grandi)\n• Riduci la lunghezza dello script o spezzalo in più episodi\n• Se è un errore Drive: lancia google_test_auth per diagnosticare\n• Controlla i log della function su Vercel dashboard` }],
         isError: true,
       };
     }
