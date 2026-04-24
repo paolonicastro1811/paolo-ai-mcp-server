@@ -114,6 +114,34 @@ function base64urlToBuffer(base64url) {
 }
 
 /**
+ * Recupera il valore di un header specifico da un array di headers Gmail.
+ */
+function gmailGetHeader(headers, name) {
+  if (!Array.isArray(headers)) return "";
+  const h = headers.find(h => h?.name?.toLowerCase() === name.toLowerCase());
+  return h?.value || "";
+}
+
+/**
+ * Estrae il corpo testo/HTML da un payload Gmail (ricorsivo su parts).
+ */
+function extractGmailBody(payload) {
+  let plain = "", html = "";
+  function walk(p) {
+    if (!p) return;
+    if (p.mimeType === "text/plain" && p.body?.data) {
+      plain += base64urlToBuffer(p.body.data).toString("utf-8");
+    } else if (p.mimeType === "text/html" && p.body?.data) {
+      html += base64urlToBuffer(p.body.data).toString("utf-8");
+    }
+    if (Array.isArray(p.parts)) for (const part of p.parts) walk(part);
+  }
+  walk(payload);
+  return { plain, html };
+}
+
+
+/**
  * Carica un Buffer su Google Drive in una cartella specifica.
  * Usa la stessa autenticazione OAuth dei tool Drive esistenti.
  *
@@ -1166,6 +1194,180 @@ app.post("/mcp", async (req, res) => {
   });
 
 
+
+  // ----- GMAIL — READ / SEARCH -----
+  server.registerTool("gmail_search_messages", {
+    title: "Gmail - Cerca Messaggi",
+    description: "Cerca email con sintassi query Gmail (es. 'from:user@example.com subject:fattura after:2025/01/01 has:attachment'). Restituisce una lista con messageId, mittente, destinatari, oggetto, data e snippet. Usa gmail_get_message con il messageId per leggere il contenuto completo.",
+    inputSchema: {
+      query: z.string().describe("Query in sintassi Gmail. Esempi: 'from:pippo@ex.com', 'is:unread', 'has:attachment', 'subject:fattura', 'after:2025/01/01', 'label:inbox'."),
+      max_results: z.number().int().min(1).max(100).default(20).describe("Numero massimo di risultati (1-100, default 20)"),
+    },
+  }, async ({ query, max_results }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const gmail = google.gmail({ version: "v1", auth });
+      const list = await gmail.users.messages.list({ userId: "me", q: query, maxResults: max_results });
+      const messages = list.data.messages || [];
+      if (messages.length === 0) {
+        return { content: [{ type: "text", text: `Nessun messaggio trovato per query: "${query}"` }] };
+      }
+      const details = [];
+      for (const m of messages) {
+        const msg = await gmail.users.messages.get({
+          userId: "me",
+          id: m.id,
+          format: "metadata",
+          metadataHeaders: ["From", "To", "Cc", "Subject", "Date"],
+        });
+        const headers = msg.data.payload?.headers || [];
+        details.push({
+          messageId: msg.data.id,
+          threadId: msg.data.threadId,
+          from: gmailGetHeader(headers, "From"),
+          to: gmailGetHeader(headers, "To"),
+          cc: gmailGetHeader(headers, "Cc"),
+          subject: gmailGetHeader(headers, "Subject"),
+          date: gmailGetHeader(headers, "Date"),
+          snippet: msg.data.snippet || "",
+          labels: msg.data.labelIds || [],
+        });
+      }
+      const summary = details.map((d, i) =>
+        `${i + 1}. messageId=${d.messageId}\n   From: ${d.from}\n   To: ${d.to}${d.cc ? `\n   Cc: ${d.cc}` : ""}\n   Subject: ${d.subject}\n   Date: ${d.date}\n   Labels: ${d.labels.join(", ")}\n   Snippet: ${d.snippet.slice(0, 220)}`
+      ).join("\n\n");
+      return { content: [{ type: "text", text: `📧 Trovati ${details.length} messaggi per "${query}":\n\n${summary}\n\n🔎 Usa gmail_get_message con il messageId per leggere il contenuto completo.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Gmail search error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("gmail_get_message", {
+    title: "Gmail - Leggi Messaggio",
+    description: "Legge il contenuto completo di un'email Gmail dato il messageId: mittente, destinatari, oggetto, data, corpo (testo semplice o HTML) ed elenco allegati. Usa truncate_body per limitare il corpo a N caratteri.",
+    inputSchema: {
+      message_id: z.string().describe("ID del messaggio Gmail (da gmail_search_messages)"),
+      truncate_body: z.number().int().min(100).optional().describe("Se impostato, tronca il corpo a questo numero di caratteri"),
+      prefer_html: z.boolean().default(false).describe("Se true preferisce la versione HTML; altrimenti testo semplice"),
+    },
+  }, async ({ message_id, truncate_body, prefer_html }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const gmail = google.gmail({ version: "v1", auth });
+      const msg = await gmail.users.messages.get({ userId: "me", id: message_id, format: "full" });
+      const headers = msg.data.payload?.headers || [];
+      const { plain, html } = extractGmailBody(msg.data.payload);
+      const attachments = extractGmailAttachments(msg.data.payload);
+      let body = prefer_html ? (html || plain) : (plain || html);
+      if (!body) body = msg.data.snippet || "(nessun contenuto)";
+      const origLen = body.length;
+      if (truncate_body && body.length > truncate_body) {
+        body = body.slice(0, truncate_body) + `\n…[troncato, ${origLen - truncate_body} caratteri in più]`;
+      }
+      const attList = attachments.length > 0
+        ? `\n\n📎 Allegati (${attachments.length}):\n` + attachments.map((a, i) =>
+            `  ${i + 1}. ${a.filename} — ${(a.size / 1024).toFixed(1)} KB — ${a.mimeType}\n     attachmentId: ${a.attachmentId}`
+          ).join("\n") + `\n\n💡 Usa gmail_download_attachment con message_id + attachment_id + filename per scaricarli.`
+        : "";
+      return { content: [{ type: "text", text: `Message ID: ${msg.data.id}\nThread ID: ${msg.data.threadId}\nLabels: ${(msg.data.labelIds || []).join(", ")}\n\nFrom: ${gmailGetHeader(headers, "From")}\nTo: ${gmailGetHeader(headers, "To")}${gmailGetHeader(headers, "Cc") ? `\nCc: ${gmailGetHeader(headers, "Cc")}` : ""}\nSubject: ${gmailGetHeader(headers, "Subject")}\nDate: ${gmailGetHeader(headers, "Date")}\n\n─── CORPO (${prefer_html ? "HTML" : "TESTO"}) ───\n\n${body}${attList}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Gmail get message error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("gmail_list_threads", {
+    title: "Gmail - Elenca Thread",
+    description: "Elenca le conversazioni Gmail che corrispondono a una query. Un thread raggruppa messaggi correlati (email originale + risposte). Usa gmail_get_thread per leggere tutti i messaggi di un thread.",
+    inputSchema: {
+      query: z.string().default("").describe("Query in sintassi Gmail (opzionale, default tutti i thread)"),
+      max_results: z.number().int().min(1).max(100).default(20).describe("Numero massimo di thread (default 20)"),
+    },
+  }, async ({ query, max_results }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const gmail = google.gmail({ version: "v1", auth });
+      const list = await gmail.users.threads.list({ userId: "me", q: query || undefined, maxResults: max_results });
+      const threads = list.data.threads || [];
+      if (threads.length === 0) {
+        return { content: [{ type: "text", text: `Nessun thread trovato per "${query}"` }] };
+      }
+      const summary = threads.map((t, i) =>
+        `${i + 1}. threadId=${t.id}\n   Snippet: ${(t.snippet || "").slice(0, 220)}`
+      ).join("\n\n");
+      return { content: [{ type: "text", text: `🧵 Trovati ${threads.length} thread:\n\n${summary}\n\n🔎 Usa gmail_get_thread con il threadId per leggere la conversazione completa.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Gmail list threads error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("gmail_get_thread", {
+    title: "Gmail - Leggi Thread",
+    description: "Legge tutti i messaggi di una conversazione Gmail (thread) in ordine cronologico, inclusi mittente, data, oggetto e corpo di ogni messaggio.",
+    inputSchema: {
+      thread_id: z.string().describe("ID del thread"),
+      truncate_body: z.number().int().min(100).optional().describe("Tronca il corpo di ciascun messaggio a N caratteri (opzionale)"),
+      prefer_html: z.boolean().default(false),
+    },
+  }, async ({ thread_id, truncate_body, prefer_html }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const gmail = google.gmail({ version: "v1", auth });
+      const thr = await gmail.users.threads.get({ userId: "me", id: thread_id, format: "full" });
+      const messages = thr.data.messages || [];
+      if (messages.length === 0) {
+        return { content: [{ type: "text", text: `Thread vuoto.` }] };
+      }
+      const parts = messages.map((m, i) => {
+        const h = m.payload?.headers || [];
+        const { plain, html } = extractGmailBody(m.payload);
+        let body = prefer_html ? (html || plain) : (plain || html);
+        if (!body) body = m.snippet || "";
+        const origLen = body.length;
+        if (truncate_body && body.length > truncate_body) {
+          body = body.slice(0, truncate_body) + `\n…[troncato, ${origLen - truncate_body} caratteri in più]`;
+        }
+        return `### Messaggio ${i + 1} [messageId=${m.id}]\nFrom: ${gmailGetHeader(h, "From")}\nDate: ${gmailGetHeader(h, "Date")}\nSubject: ${gmailGetHeader(h, "Subject")}\n\n${body}`;
+      }).join("\n\n───────────────\n\n");
+      return { content: [{ type: "text", text: `🧵 Thread ID: ${thread_id}\nNumero messaggi: ${messages.length}\n\n${parts}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Gmail get thread error: ${err.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("gmail_export_message_eml", {
+    title: "Gmail - Esporta Email come .eml",
+    description: "Esporta un'email Gmail come file .eml (formato RFC 5322 standard con tutti gli header originali e gli allegati). Il file viene caricato su Vercel Blob e ne viene restituito un URL pubblico (cleanup automatico dopo 24h). Utile per archiviazione o import in altri client mail.",
+    inputSchema: {
+      message_id: z.string().describe("ID del messaggio Gmail da esportare"),
+      filename: z.string().optional().describe("Nome file .eml (opzionale, default: usa oggetto email sanitizzato)"),
+    },
+  }, async ({ message_id, filename }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const gmail = google.gmail({ version: "v1", auth });
+      const msg = await gmail.users.messages.get({ userId: "me", id: message_id, format: "raw" });
+      if (!msg.data.raw) throw new Error("Formato raw non disponibile");
+      const buffer = base64urlToBuffer(msg.data.raw);
+      let finalName = filename;
+      if (!finalName) {
+        const meta = await gmail.users.messages.get({ userId: "me", id: message_id, format: "metadata", metadataHeaders: ["Subject"] });
+        const subject = gmailGetHeader(meta.data.payload?.headers || [], "Subject") || message_id;
+        finalName = subject.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80) + ".eml";
+      }
+      if (!finalName.toLowerCase().endsWith(".eml")) finalName += ".eml";
+      const url = await uploadBufferToBlob(buffer, finalName, "gmail-exports");
+      return { content: [{ type: "text", text: `✅ Email esportata come .eml\n\n📧 Message ID: ${message_id}\n📁 File: ${finalName}\n📊 Dimensione: ${(buffer.length / 1024).toFixed(1)} KB\n🔗 URL: ${url}\n\n⚠️ Il file sarà eliminato automaticamente entro 24h.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Gmail export error: ${err.message}` }], isError: true };
+    }
+  });
+
+
   // ----- GOOGLE DRIVE -----
   server.registerTool("drive_download_file", {
     title: "Drive - Scarica File",
@@ -1444,7 +1646,7 @@ app.get("/mcp", (_req, res) => {
 
 async function runCleanup(maxAgeHours) {
   const cutoffMs = Date.now() - maxAgeHours * 3600 * 1000;
-  const prefixes = ["gmail-attachments/", "drive-files/", "drive-exports/", "tts-podcasts/"];
+  const prefixes = ["gmail-attachments/", "gmail-exports/", "drive-files/", "drive-exports/", "tts-podcasts/"];
 
   const summary = {
     started_at: new Date().toISOString(),
