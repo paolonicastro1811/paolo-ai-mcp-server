@@ -1060,6 +1060,112 @@ app.post("/mcp", async (req, res) => {
     }
   });
 
+
+  server.registerTool("gmail_send_with_attachments", {
+    title: "Gmail - Invia Email con Allegati",
+    description: "Invia un'email dal tuo account Gmail con uno o più allegati. Ogni allegato va fornito con filename e content_base64 (contenuto del file codificato in base64) oppure url (URL pubblico da cui il server scaricherà il file). Supporta destinatari multipli, CC, BCC, e corpo testo o HTML. Limite totale del messaggio ~25 MB (Gmail API).",
+    inputSchema: {
+      to: z.string().describe("Destinatario/i, separati da virgola se multipli"),
+      subject: z.string().describe("Oggetto dell'email"),
+      body: z.string().describe("Corpo dell'email (testo o HTML)"),
+      cc: z.string().optional().describe("CC (opzionale, separati da virgola)"),
+      bcc: z.string().optional().describe("BCC (opzionale, separati da virgola)"),
+      is_html: z.boolean().default(false).describe("True se body è HTML, false per testo"),
+      attachments: z.array(z.object({
+        filename: z.string().describe("Nome del file come apparirà nell'email"),
+        mime_type: z.string().optional().describe("MIME type (default application/octet-stream). Es: application/pdf, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        content_base64: z.string().optional().describe("Contenuto del file codificato in base64 (standard, non base64url)"),
+        url: z.string().optional().describe("URL pubblico da cui il server scaricherà il file se content_base64 non è fornito"),
+      })).min(1).describe("Array di allegati (almeno 1). Ognuno deve avere filename e content_base64 OPPURE url."),
+    },
+  }, async ({ to, subject, body, cc, bcc, is_html, attachments }) => {
+    try {
+      const google = await loadGoogleapis();
+      const auth = await getGoogleAuth();
+      const gmail = google.gmail({ version: "v1", auth });
+
+      // Risolvi il contenuto di ciascun allegato (base64 inline o fetch da URL)
+      const resolved = [];
+      for (const att of attachments) {
+        let buffer;
+        if (att.content_base64) {
+          buffer = Buffer.from(att.content_base64, "base64");
+        } else if (att.url) {
+          const resp = await fetch(att.url);
+          if (!resp.ok) throw new Error(`Impossibile scaricare allegato "${att.filename}" da ${att.url}: HTTP ${resp.status}`);
+          const arr = await resp.arrayBuffer();
+          buffer = Buffer.from(arr);
+        } else {
+          throw new Error(`Allegato "${att.filename}" senza content_base64 né url`);
+        }
+        resolved.push({
+          filename: att.filename,
+          mimeType: att.mime_type || "application/octet-stream",
+          buffer,
+        });
+      }
+
+      // Costruzione messaggio MIME multipart/mixed
+      const boundary = `----=_Part_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const subjectEncoded = `=?UTF-8?B?${Buffer.from(subject).toString("base64")}?=`;
+      const bodyContentType = is_html ? "text/html; charset=UTF-8" : "text/plain; charset=UTF-8";
+
+      const headers = [
+        `To: ${to}`,
+        cc ? `Cc: ${cc}` : null,
+        bcc ? `Bcc: ${bcc}` : null,
+        `Subject: ${subjectEncoded}`,
+        "MIME-Version: 1.0",
+        `Content-Type: multipart/mixed; boundary="${boundary}"`,
+      ].filter(Boolean).join("\r\n");
+
+      const parts = [];
+      // Parte corpo
+      parts.push(
+        `--${boundary}\r\n` +
+        `Content-Type: ${bodyContentType}\r\n` +
+        `Content-Transfer-Encoding: 7bit\r\n\r\n` +
+        `${body}\r\n`
+      );
+      // Parti allegati
+      for (const att of resolved) {
+        const b64 = att.buffer.toString("base64").replace(/(.{76})/g, "$1\r\n");
+        const filenameEncoded = `=?UTF-8?B?${Buffer.from(att.filename).toString("base64")}?=`;
+        parts.push(
+          `--${boundary}\r\n` +
+          `Content-Type: ${att.mimeType}; name="${filenameEncoded}"\r\n` +
+          `Content-Disposition: attachment; filename="${filenameEncoded}"\r\n` +
+          `Content-Transfer-Encoding: base64\r\n\r\n` +
+          `${b64}\r\n`
+        );
+      }
+      parts.push(`--${boundary}--`);
+
+      const rawMessage = `${headers}\r\n\r\n${parts.join("")}`;
+      const encodedMessage = Buffer.from(rawMessage).toString("base64")
+        .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+      const result = await gmail.users.messages.send({
+        userId: "me",
+        requestBody: { raw: encodedMessage },
+      });
+
+      const totalBytes = resolved.reduce((s, a) => s + a.buffer.length, 0);
+      const attSummary = resolved
+        .map(a => `  • ${a.filename} (${(a.buffer.length / 1024).toFixed(1)} KB, ${a.mimeType})`)
+        .join("\n");
+      return {
+        content: [{
+          type: "text",
+          text: `✅ Email inviata con ${resolved.length} allegato/i\nMessage ID: ${result.data.id}\nA: ${to}${cc ? `\nCC: ${cc}` : ""}${bcc ? `\nBCC: ${bcc}` : ""}\nOggetto: ${subject}\nDimensione totale allegati: ${(totalBytes / 1024).toFixed(1)} KB\n\nAllegati:\n${attSummary}`
+        }]
+      };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Gmail send-with-attachments error: ${err.message}` }], isError: true };
+    }
+  });
+
+
   // ----- GOOGLE DRIVE -----
   server.registerTool("drive_download_file", {
     title: "Drive - Scarica File",
